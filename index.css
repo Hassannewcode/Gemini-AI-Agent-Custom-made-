@@ -561,7 +561,33 @@ input:checked ~ span {
 }
 
 /* Sandbox Tabs */
-.sandbox-tabs { display: flex; align-items: center; background-color: var(--surface-color); padding: 0 8px; gap: 4px; user-select: none; }
+.sandbox-tabs {
+    display: flex;
+    align-items: center;
+    background-color: var(--surface-color);
+    padding: 0 8px;
+    gap: 4px;
+    user-select: none;
+    overflow-x: auto;
+    scroll-behavior: smooth;
+    padding-bottom: 2px; /* For scrollbar */
+}
+/* Custom scrollbar for tabs */
+.sandbox-tabs::-webkit-scrollbar {
+    height: 4px;
+}
+.sandbox-tabs::-webkit-scrollbar-track {
+    background: transparent;
+}
+.sandbox-tabs::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb-color);
+    border-radius: 2px;
+}
+.sandbox-tabs::-webkit-scrollbar-thumb:hover {
+    background: var(--scrollbar-thumb-hover-color);
+}
+
+
 .sandbox-tab {
     padding: 10px 12px;
     cursor: pointer;
@@ -573,6 +599,7 @@ input:checked ~ span {
     align-items: center;
     gap: 8px;
     max-width: 150px;
+    flex-shrink: 0;
 }
 .sandbox-tab:hover { color: var(--text-color); }
 .sandbox-tab.active { color: var(--primary-color); border-bottom-color: var(--primary-color); font-weight: 500;}
@@ -590,6 +617,7 @@ input:checked ~ span {
     outline: none;
     font: inherit;
     width: 120px;
+    flex-shrink: 0;
 }
 .add-file-input {
     padding: 8px 12px;
@@ -599,6 +627,7 @@ input:checked ~ span {
 #add-file-button {
     background: none; border: none; color: var(--subtle-text-color); padding: 8px; cursor: pointer;
     border-radius: 4px; transition: all 0.2s;
+    margin-left: auto; /* Push it to the end */
 }
 #add-file-button:hover { background-color: var(--ai-message-bg); color: var(--text-color); }
 
@@ -1037,6 +1066,10 @@ body.light-theme .modal-button.confirm { color: white; }
 body.light-theme .custom-context-menu li:hover {
     color: white;
 }
+.custom-context-menu li.hidden {
+    display: none;
+}
+
 
 /* --- Toast Notifications --- */
 #toast-container {
