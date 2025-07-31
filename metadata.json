@@ -1,0 +1,5 @@
+{
+  "name": "Gemini AI Agent",
+  "description": "An advanced chat agent powered by the Gemini API, featuring persistent chat history and web browsing capabilities.",
+  "requestFramePermissions": []
+}

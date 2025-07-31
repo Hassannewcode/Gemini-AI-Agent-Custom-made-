@@ -1,0 +1,1234 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import { GoogleGenAI, GenerateContentResponse, Content, Part, Type } from "@google/genai";
+import { marked } from "https://esm.sh/marked@12.0.2";
+import JSZip from 'jszip';
+import saveAs from 'file-saver';
+
+
+// Make Prism available in the global scope for TypeScript
+declare const Prism: any;
+
+const API_KEY = process.env.API_KEY;
+
+if (!API_KEY) {
+  const chatContainer = document.getElementById('chat-messages') as HTMLElement;
+  chatContainer.innerHTML = '<div class="message error-message"><div class="message-content"><p>Error: API key is missing. Please set the API_KEY environment variable.</p></div></div>';
+  throw new Error("API key is missing.");
+}
+
+const ai = new GoogleGenAI({ apiKey: API_KEY });
+
+// --- UI Elements ---
+const chatContainer = document.getElementById('chat-messages') as HTMLElement;
+const chatForm = document.getElementById('chat-form') as HTMLFormElement;
+const chatInput = document.getElementById('chat-input') as HTMLTextAreaElement;
+const sendButton = document.getElementById('send-button') as HTMLButtonElement;
+const newChatButton = document.getElementById('new-chat-button') as HTMLButtonElement;
+const historyList = document.getElementById('chat-history-list') as HTMLUListElement;
+const searchToggle = document.getElementById('search-toggle') as HTMLInputElement;
+const codingToggle = document.getElementById('coding-toggle') as HTMLInputElement;
+const chatHeader = document.querySelector('.chat-header') as HTMLElement;
+const chatTitle = document.getElementById('chat-title') as HTMLElement;
+const cloudBrowserPreview = document.getElementById('cloud-browser-preview') as HTMLElement;
+
+// Clear History Modal
+const clearHistoryButton = document.getElementById('clear-history-button') as HTMLButtonElement;
+const clearHistoryModal = document.getElementById('clear-history-modal') as HTMLElement;
+const cancelClearButton = document.getElementById('cancel-clear-button') as HTMLButtonElement;
+const confirmClearButton = document.getElementById('confirm-clear-button') as HTMLButtonElement;
+const confirmClearInput = document.getElementById('confirm-clear-input') as HTMLInputElement;
+
+// Generic Confirmation Modal
+const confirmModal = document.getElementById('confirm-modal') as HTMLElement;
+const confirmModalTitle = document.getElementById('confirm-modal-title') as HTMLElement;
+const confirmModalText = document.getElementById('confirm-modal-text') as HTMLElement;
+const confirmModalCancel = document.getElementById('confirm-modal-cancel') as HTMLButtonElement;
+const confirmModalConfirm = document.getElementById('confirm-modal-confirm') as HTMLButtonElement;
+
+
+// Coding Sandbox
+const sandboxContainer = document.getElementById('coding-sandbox-container') as HTMLElement;
+const sandboxTabs = document.getElementById('sandbox-tabs') as HTMLElement;
+const addFileButton = document.getElementById('add-file-button') as HTMLButtonElement;
+const sandboxEditorWrapper = document.querySelector('.sandbox-editor-wrapper') as HTMLElement;
+const sandboxCodePre = document.getElementById('sandbox-code-pre') as HTMLElement;
+const sandboxCodeHighlight = document.getElementById('sandbox-code-highlight') as HTMLElement;
+const sandboxCodeEditor = document.getElementById('sandbox-code-editor') as HTMLTextAreaElement;
+const sandboxPreviewPanel = document.querySelector('.sandbox-preview-panel') as HTMLElement;
+const sandboxPreviewTitle = document.getElementById('sandbox-preview-title') as HTMLElement;
+const sandboxPreviewIframe = document.getElementById('sandbox-preview-iframe') as HTMLIFrameElement;
+const sandboxConsoleOutput = document.getElementById('console-output') as HTMLElement;
+const runCodeButton = document.getElementById('run-code-button') as HTMLButtonElement;
+const closeSandboxButton = document.getElementById('close-sandbox-button') as HTMLButtonElement;
+const sandboxResizer = document.getElementById('sandbox-resizer') as HTMLElement;
+const fullscreenButton = document.getElementById('fullscreen-button') as HTMLButtonElement;
+const sandboxContextMenu = document.getElementById('sandbox-context-menu') as HTMLElement;
+const contextRename = document.getElementById('context-rename') as HTMLLIElement;
+const contextDelete = document.getElementById('context-delete') as HTMLLIElement;
+
+// AI Action Modal
+const aiActionModal = document.getElementById('ai-action-modal') as HTMLElement;
+const aiActionList = document.getElementById('ai-action-list') as HTMLUListElement;
+const allowAiActionButton = document.getElementById('allow-ai-action-button') as HTMLButtonElement;
+const denyAiActionButton = document.getElementById('deny-ai-action-button') as HTMLButtonElement;
+
+// Settings Modal
+const settingsButton = document.getElementById('settings-button') as HTMLButtonElement;
+const settingsModal = document.getElementById('settings-modal') as HTMLElement;
+const closeSettingsButton = document.getElementById('close-settings-button') as HTMLButtonElement;
+const themeSelector = document.getElementById('theme-selector') as HTMLSelectElement;
+const temperatureSlider = document.getElementById('temperature-slider') as HTMLInputElement;
+const temperatureValue = document.getElementById('temperature-value') as HTMLSpanElement;
+const typingSpeedSlider = document.getElementById('typing-speed-slider') as HTMLInputElement;
+const typingSpeedValue = document.getElementById('typing-speed-value') as HTMLSpanElement;
+const clearSandboxButton = document.getElementById('clear-sandbox-button') as HTMLButtonElement;
+const exportZipButton = document.getElementById('export-zip-button') as HTMLButtonElement;
+
+
+// --- Types and State ---
+type AppSettings = {
+    theme: 'dark' | 'light';
+    temperature: number;
+    typingWPM: number;
+};
+type ChatSession = {
+  id: string;
+  title: string;
+  createdAt: number;
+  history: Content[];
+};
+type SandboxFile = {
+    id: string;
+    name: string;
+    content: string;
+};
+type AIFileAction = {
+    action_type: 'create_file' | 'update_file' | 'delete_file';
+    file_name: string;
+    content?: string;
+};
+type AIResponse = {
+    displayText: string;
+    actions?: AIFileAction[];
+};
+
+let allChats: Record<string, ChatSession> = {};
+let currentChatId: string | null = null;
+let appSettings: AppSettings = { theme: 'dark', temperature: 0.5, typingWPM: 155 };
+const CONFIRMATION_PHRASE = "Clear all of my chat history";
+let pendingAIActions: AIFileAction[] | null = null;
+let contextMenuFileId: string | null = null;
+
+let codingSandboxState: {
+    activeFileId: string | null;
+    files: Record<string, SandboxFile>;
+    previewFile: string;
+} = {
+    activeFileId: null,
+    files: {},
+    previewFile: 'index.html'
+};
+
+const responseSchema = {
+    type: Type.OBJECT,
+    properties: {
+        displayText: {
+            type: Type.STRING,
+            description: "A short, helpful explanation of the changes you are making for the user. This is always required."
+        },
+        actions: {
+            type: Type.ARRAY,
+            nullable: true,
+            description: "An optional list of file operations for the coding sandbox.",
+            items: {
+                type: Type.OBJECT,
+                required: ["action_type", "file_name"],
+                properties: {
+                    action_type: {
+                        type: Type.STRING,
+                        enum: ['create_file', 'update_file', 'delete_file'],
+                        description: "The type of file operation."
+                    },
+                    file_name: {
+                        type: Type.STRING,
+                        description: "The name of the file to perform the action on (e.g., 'index.html')."
+                    },
+                    content: {
+                        type: Type.STRING,
+                        nullable: true,
+                        description: "The full code content of the file. Required for 'create_file' and 'update_file'."
+                    }
+                }
+            }
+        }
+    }
+};
+
+// --- State Management and Initialization ---
+
+function loadSettings() {
+    const storedSettings = localStorage.getItem('gemini-app-settings');
+    if (storedSettings) {
+        appSettings = { ...appSettings, ...JSON.parse(storedSettings) };
+    }
+}
+
+function saveSettings() {
+    localStorage.setItem('gemini-app-settings', JSON.stringify(appSettings));
+}
+
+function loadChatsFromStorage() {
+  const storedChats = localStorage.getItem('gemini-chat-history');
+  if (storedChats) {
+    allChats = JSON.parse(storedChats);
+  }
+}
+
+function saveChatsToStorage() {
+  try {
+    localStorage.setItem('gemini-chat-history', JSON.stringify(allChats));
+  } catch (e) {
+    console.error("Failed to save chats to storage.", e);
+    showToast("Could not save chat history. Storage might be full.", 'error');
+  }
+}
+
+function initializeApp() {
+  loadSettings();
+  loadChatsFromStorage();
+  applyTheme();
+  renderChatHistory();
+  const latestChatId = Object.keys(allChats).sort((a, b) => allChats[b].createdAt - allChats[a].createdAt)[0];
+  if (latestChatId) {
+    loadChat(latestChatId);
+  } else {
+    startNewChat();
+  }
+  setupEventListeners();
+  setupSandboxListeners();
+}
+
+// --- Chat Operations ---
+
+function startNewChat() {
+  const newId = `chat_${Date.now()}`;
+  const newChat: ChatSession = {
+    id: newId,
+    title: 'New Chat',
+    createdAt: Date.now(),
+    history: [],
+  };
+  allChats[newId] = newChat;
+  saveChatsToStorage();
+  renderChatHistory();
+  loadChat(newId);
+}
+
+function loadChat(id: string) {
+  if (!allChats[id]) return;
+  currentChatId = id;
+  const chat = allChats[id];
+  chatContainer.innerHTML = '';
+  cloudBrowserPreview.style.display = 'none';
+  sandboxContainer.style.display = 'none';
+  codingToggle.checked = false;
+
+  if (chat.history.length === 0) {
+    appendMessage('ai', { displayText: 'Hello! I\'m Gemini. How can I assist you today?'});
+  } else {
+     chat.history.forEach(item => {
+        const role = item.role === 'user' ? 'user' : 'ai';
+        let content: AIResponse;
+        try {
+            const textContent = (item.parts[0] as {text: string}).text;
+            if (role === 'ai') {
+                content = JSON.parse(textContent);
+            } else {
+                content = { displayText: textContent };
+            }
+        } catch (e) {
+            // Gracefully handle old message formats or errors
+            const rawText = (item.parts[0] as {text: string}).text || '';
+            content = { displayText: rawText };
+        }
+        appendMessage(role, content);
+    });
+  }
+  
+  chatTitle.textContent = chat.title;
+  updateActiveHistoryItem();
+  setFormState(true);
+}
+
+function deleteChat(id: string) {
+    showConfirmationModal(
+        'Delete Chat?',
+        `Are you sure you want to permanently delete the chat titled "${allChats[id].title}"?`,
+        () => {
+            if (!allChats[id]) return;
+            delete allChats[id];
+            saveChatsToStorage();
+            renderChatHistory();
+            if (currentChatId === id) {
+                const latestChatId = Object.keys(allChats).sort((a, b) => allChats[b].createdAt - allChats[a].createdAt)[0];
+                if (latestChatId) {
+                    loadChat(latestChatId);
+                } else {
+                    startNewChat();
+                }
+            }
+        }
+    );
+}
+
+function renameChat(id: string, newTitle: string) {
+    if (!allChats[id] || !newTitle.trim()) return;
+    allChats[id].title = newTitle.trim();
+    saveChatsToStorage();
+    renderChatHistory();
+    if (id === currentChatId) {
+        chatTitle.textContent = newTitle.trim();
+    }
+}
+
+function performClearAllHistory() {
+    allChats = {};
+    saveChatsToStorage();
+    renderChatHistory();
+    startNewChat();
+}
+
+async function generateChatTitle(userPrompt: string, aiResponse: string) {
+    if (!currentChatId || allChats[currentChatId].history.length > 2) return;
+    try {
+        const prompt = `Based on this conversation:\n\nUser: "${userPrompt}"\nAI: "${aiResponse}"\n\nGenerate a very short, concise title for this chat (5 words max).`;
+        const result = await ai.models.generateContent({model: 'gemini-2.5-flash', contents: prompt });
+        const newTitle = result.text.replace(/"/g, '').trim();
+        if (newTitle && currentChatId) {
+            renameChat(currentChatId, newTitle);
+        }
+    } catch (e) {
+        console.warn("Could not generate chat title.", e);
+    }
+}
+
+
+// --- UI Rendering ---
+
+function renderChatHistory() {
+  historyList.innerHTML = '';
+  Object.values(allChats)
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .forEach(chat => {
+      const li = document.createElement('li');
+      li.className = 'history-item';
+      li.dataset.id = chat.id;
+      li.title = chat.title;
+      li.innerHTML = `
+        <span>${chat.title}</span>
+        <button class="delete-chat-button" aria-label="Delete chat" title="Delete chat"><i class="fa-solid fa-trash-can"></i></button>
+      `;
+      historyList.appendChild(li);
+    });
+  updateActiveHistoryItem();
+}
+
+function updateActiveHistoryItem() {
+  document.querySelectorAll('.history-item').forEach(item => {
+    item.classList.toggle('active', item.getAttribute('data-id') === currentChatId);
+  });
+}
+
+function appendMessage(sender: 'user' | 'ai', content: AIResponse): HTMLElement {
+  const messageElement = document.createElement('div');
+  messageElement.className = `message ${sender}-message`;
+  const avatarSrc = sender === 'user'
+    ? 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxyZWN0IHdpZHRoPSIxOCIgaGVpZ2h0PSIxOCIgeD0iMyIgeT0iMyIgcng9IjEwMCIvPjxwYXRoIGQ9Ik0xOCAxN2ExMi44IDEyLjggMCAwIDAtMTIgMCIvPjwvc3ZnPg=='
+    : 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNDgiIGhlaWdodD0iNDgiIHZpZXdCb3g9IjAgMCA0OCA0OCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTI0IDRDMTIuOTU0MyA0IDQgMTIuOTU0MyA0IDI0QzQgMzUuMDQ1NyAxMi45NTQzIDQ0IDI0IDQ0QzM1LjA0NTcgNDQgNDQgMzUuMDQ1NyA0NCAyNEM0NCAxMi45NTQzIDM1LjA0NTcgNCAyNCA0WiIgZmlsbD0iIzhBQjRGOCIvPgo8cGF0aCBmaWxsLXJ1bGU9ImV2ZW5vZGQiIGNsaXAtcnVsZT0iZXZlbm9kZCIgZD0iTTI0LjAwMDEgMTJDMjguMjgxOCAxMiAzMi4xMzg0IDEzLjc5MjQgMzQuODE2OCAxNi41ODE2QzMzLjU2MTMgMTguNzA5IDMyLjM5MjYgMjAuOTEwMyAzMS4zMTA2IDIzLjE4NTNDMzAuOTgzOSAyMy45MDA5IDMxLjA1NDYgMjQuNzMzMSAzMS41MjIyIDI1LjM5OThDMzIuOTU4NyAyNy4yNDcxIDM0LjkwODQgMjkuMjE1MiAzNy4zNzMyIDMxLjI5MzNDMzUuNzk3OSAzMy4zMjU5IDMzLjcyNTkgMzQuOTA1NiAzMS4yODQxIDM1LjgwMUMyOS4wNzE1IDM2LjYxMTYgMjYuNjU3NSAzNi41MjYyIDI0LjU3MTQgMzUuNTY4M0MyMC42NzEgMzMuODAxNiAxNy44MDg1IDMwLjE0MTMgMTcuMzg4MiAyNS44MzQ0QzE2Ljk2NzggMjEuNTI3NSAxOS4wNjg5IDE3LjQzMzMgMjIuODQyNyAxNS4zNTI0QzI0Ljg5MTYgMTQuMjg4MiAyNy4yNDU4IDE0LjE2MjMgMjkuNDE4NCAxNC45NDU4QzI4LjUzNjEgMTQuMTI4NyAyNy42NzQ5IDEzLjM4NTcgMjYuODM0NyAxMi43MTY4QzI1Ljk2ODYgMTIuMjQ3MSAyNC45OTk2IDEyIDI0LjAwMDEgMTJaIiBmaWxsPSJ3aGl0ZSIvPgo8cGF0aCBmaWxsLXJ1bGU9ImV2ZW5vZGQiIGNsaXAtcnVsZT0iZXZlbm9kZCIgZD0iTTE2LjU4MTYgMzQuODE2OEMxOC43MDkgMzMuNTYxMyAyMC45MTAzIDMyLjM5MjYgMjMuMTg1MyAzMS4zMTA2QzIzLjkwMDkgMzAuOTgzOSAyNC43MzMxIDMxLjA1NDYgMjUuMzk5OCAzMS41MjIyQzI3LjI0NzEgMzIuOTU4NyAyOS4yMTUyIDM0LjkwODQgMzEuMjkzMyAzNy4zNzMyQzMzLjMyNTkgMzUuNzk3OSAzNC45MDU2IDMzLjcyNTkgMzUuODAxIDMxLjI4NDFDMzYuNjExNiAyOS4wNzE1IDM2LjUyNjIgMjYuNjU3NSAzNS41NjgzIDI0LjU3MTRDMzMuODAxNiAyMC42NzEgMzAuMTQxMyAxNy44MDg1IDI1LjgzNDQgMTcuMzg4MkMyMS41Mjc1IDE2Ljk2NzggMTcuNDMzMyAxOS4wNjg5IDE1LjM1MjQgMjIuODQyN0MxNC4yODgyIDI0Ljg5MTYgMTQuMTYyMyAyNy4yNDU4IDE0Ljk0NTggMjkuNDE4NEMxNC4xMjg3IDI4LjUzNjEgMTMuMzg1NyAyNy42NzQ5IDEyLjcxNjggMjYuODM0N0MxMi4yNDcxIDI1Ljk2ODYgMTIgMjQuOTk5NiAxMiAyNC4wMDAxQzEyIDI4LjI4MTggMTMuNzkyNCAzMi4xMzg0IDE2LjU4MTYgMzQuODE2OFoiIGZpbGw9IndoaXRlIi8+Cjwvc3ZnPgo=';
+  
+  const textHtml = marked.parse(content.displayText || '') as string;
+
+  messageElement.innerHTML = `
+      <img src="${avatarSrc}" alt="${sender} Avatar" class="avatar">
+      <div class="message-content">
+        ${textHtml}
+      </div>
+  `;
+
+  chatContainer.appendChild(messageElement);
+  chatContainer.scrollTop = chatContainer.scrollHeight;
+
+  return messageElement;
+}
+
+function renderCloudBrowserPreview(state: 'searching' | 'results', data?: any) {
+    if (state === 'searching') {
+        cloudBrowserPreview.style.display = 'block';
+        cloudBrowserPreview.innerHTML = `
+            <h4><i class="fa-solid fa-cloud"></i> Cloud Browser</h4>
+            <div class="cloud-browser-content">
+                <p>Searching the web for: "<em>${data}</em>"</p>
+                <div class="thinking-indicator small"><span></span><span></span><span></span></div>
+            </div>
+        `;
+    } else if (state === 'results' && data && data.length > 0) {
+        const sourcesList = data.map((chunk: any) => `
+            <li class="source-item">
+                <a href="${chunk.web.uri}" target="_blank" rel="noopener noreferrer">
+                    <i class="fa-solid fa-link"></i>
+                    ${chunk.web.title || new URL(chunk.web.uri).hostname}
+                </a>
+            </li>
+        `).join('');
+        cloudBrowserPreview.innerHTML = `
+            <h4><i class="fa-solid fa-cloud-arrow-down"></i> Cloud Browser Results</h4>
+            <div class="cloud-browser-content">
+                <p>Used the following sources to generate the answer:</p>
+                <ul class="sources-list">${sourcesList}</ul>
+            </div>
+        `;
+    } else {
+        cloudBrowserPreview.style.display = 'none';
+    }
+}
+
+
+function setFormState(enabled: boolean) {
+  chatInput.disabled = !enabled;
+  sendButton.disabled = !enabled;
+  sendButton.classList.toggle('loading', !enabled);
+  if (enabled) chatInput.focus();
+}
+
+function showToast(message: string, type: 'success' | 'error' | 'info' = 'info') {
+    const container = document.getElementById('toast-container');
+    if (!container) return;
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+    toast.textContent = message;
+    container.appendChild(toast);
+    setTimeout(() => {
+        toast.classList.add('show');
+    }, 10);
+    setTimeout(() => {
+        toast.classList.remove('show');
+        setTimeout(() => {
+            toast.remove();
+        }, 300);
+    }, 3000);
+}
+
+
+// --- Main Chat Logic ---
+
+async function handleSendMessage(event: Event | string) {
+  if (typeof event !== 'string') {
+      event.preventDefault();
+  }
+  
+  if (!currentChatId) {
+    showToast("No active chat session.", 'error');
+    return;
+  }
+  
+  const messageText = (typeof event === 'string') ? event : chatInput.value.trim();
+  if (!messageText) return;
+
+  setFormState(false);
+  appendMessage('user', { displayText: messageText });
+  const userMessageContent: Content = { role: 'user', parts: [{ text: messageText }] };
+  allChats[currentChatId].history.push(userMessageContent);
+  chatInput.value = '';
+  chatInput.style.height = 'auto';
+
+  const aiMessageElement = appendMessage('ai', {displayText: ''});
+  const thinkingIndicator = document.createElement('div');
+  thinkingIndicator.className = 'thinking-indicator';
+  thinkingIndicator.innerHTML = '<span></span><span></span><span></span>';
+  aiMessageElement.querySelector('.message-content')?.appendChild(thinkingIndicator);
+  
+  try {
+    const useSearch = searchToggle.checked;
+    const useCodingSandbox = codingToggle.checked;
+    
+    let fullResponseText = '';
+    let finalResponse: GenerateContentResponse | undefined;
+    let stream;
+    const modelConfig = { temperature: appSettings.temperature };
+
+    if (useSearch) {
+        cloudBrowserPreview.style.display = 'block';
+        sandboxContainer.style.display = 'none';
+        renderCloudBrowserPreview('searching', messageText);
+        const systemInstruction = "You are a helpful research assistant. Your goal is to answer the user's question based on the provided search results. Summarize the information clearly and concisely.";
+        stream = await ai.models.generateContentStream({
+            model: 'gemini-2.5-flash',
+            contents: [...allChats[currentChatId].history],
+            config: { systemInstruction, tools: [{ googleSearch: {} }], ...modelConfig }
+        });
+
+    } else if (useCodingSandbox) {
+        cloudBrowserPreview.style.display = 'none';
+        const filesContext = Object.values(codingSandboxState.files)
+            .map(f => `// file: ${f.name}\n${f.content}`)
+            .join('\n\n---\n\n');
+        
+        const systemInstruction = `You are an expert AI assistant integrated into a web coding sandbox. You have been provided with the full content of all current files in the sandbox. Your task is to help the user with their request by generating a sequence of file operations. Analyze the user's request and the provided file content. Be concise. Only modify what is necessary. If the user asks to create a new project, create at least an index.html, style.css, and script.js. Your response MUST be a single JSON object that strictly follows the provided schema. Do NOT write any text or explanation outside of this JSON object.
+        
+        CURRENT FILES IN SANDBOX:
+        ${filesContext || "(No files in sandbox yet)"}`;
+
+        stream = await ai.models.generateContentStream({
+            model: 'gemini-2.5-flash',
+            contents: [...allChats[currentChatId].history, {role: 'user', parts: [{text: messageText}]}],
+            config: {
+                systemInstruction: systemInstruction,
+                responseMimeType: "application/json",
+                responseSchema: responseSchema,
+                ...modelConfig
+            }
+        });
+
+    } else {
+        cloudBrowserPreview.style.display = 'none';
+        sandboxContainer.style.display = 'none';
+        const systemInstruction = `You are an advanced AI agent, Gemini. Your goal is to provide helpful and well-formatted text answers.`;
+        
+        stream = await ai.models.generateContentStream({
+            model: 'gemini-2.5-flash',
+            contents: [...allChats[currentChatId].history],
+            config: { systemInstruction, ...modelConfig }
+        });
+    }
+
+    // --- Process Stream for all modes ---
+    for await (const chunk of stream) {
+        thinkingIndicator.remove();
+        const text = chunk.text;
+        if (text) {
+            fullResponseText += text;
+        }
+        finalResponse = chunk;
+        if (useSearch || !useCodingSandbox) { // For search or normal agent mode, stream text directly
+             aiMessageElement.querySelector('.message-content')!.innerHTML = marked.parse(fullResponseText) as string;
+        }
+    }
+
+    // --- Post-processing based on mode ---
+    let aiResponse: AIResponse;
+    if (useSearch) {
+        aiResponse = { displayText: fullResponseText };
+        const groundingMetadata = finalResponse?.candidates?.[0]?.groundingMetadata;
+        if (groundingMetadata?.groundingChunks && groundingMetadata.groundingChunks.length > 0) {
+            renderCloudBrowserPreview('results', groundingMetadata.groundingChunks);
+        } else {
+            cloudBrowserPreview.style.display = 'none';
+        }
+    } else { // Agent or Coding Mode
+        try {
+            // Attempt 1: Direct parsing
+            aiResponse = JSON.parse(fullResponseText);
+        } catch (e) {
+            console.warn("Direct JSON.parse failed. Trying to extract from markdown.", fullResponseText);
+            // Attempt 2: Extract from ```json ... ```
+            const jsonMatch = fullResponseText.match(/```json\s*([\s\S]*?)\s*```/);
+            if (jsonMatch && jsonMatch[1]) {
+                try {
+                    aiResponse = JSON.parse(jsonMatch[1]);
+                } catch (e2) {
+                    console.error("Failed to parse extracted AI JSON response:", e2, "\nExtracted text:", jsonMatch[1]);
+                    showToast("AI returned malformed JSON.", 'error');
+                    aiResponse = { displayText: fullResponseText }; // Fallback
+                }
+            } else {
+                 console.error("Failed to parse AI JSON response and no markdown block found:", e, "\nResponse text:", fullResponseText);
+                 showToast("AI did not respond with a valid action.", 'info');
+                 aiResponse = { displayText: fullResponseText }; // Final fallback
+            }
+        }
+        
+        const textHtml = marked.parse(aiResponse.displayText || '') as string;
+        aiMessageElement.querySelector('.message-content')!.innerHTML = textHtml;
+        
+        if (aiResponse.actions && aiResponse.actions.length > 0) {
+            showAiActionConfirmation(aiResponse.actions);
+        } else {
+             if (useCodingSandbox) sandboxContainer.style.display = 'flex';
+        }
+    }
+    
+    const aiMessageContent: Content = { role: 'model', parts: [{ text: JSON.stringify(aiResponse) }]};
+    allChats[currentChatId].history.push(aiMessageContent);
+    saveChatsToStorage();
+
+    if (allChats[currentChatId].history.length <= 2) {
+      generateChatTitle(messageText, aiResponse.displayText);
+    }
+
+  } catch (error: any) {
+    console.error(error);
+    thinkingIndicator.remove();
+    cloudBrowserPreview.style.display = 'none';
+    const contentDiv = aiMessageElement.querySelector('.message-content');
+    
+    if (contentDiv) {
+        const errorMessage = String(error.message || error);
+        let userFriendlyMessage = "";
+        if (errorMessage.includes('429') || errorMessage.includes('RESOURCE_EXHAUSTED')) {
+            userFriendlyMessage = "Rate limit reached. You've sent requests too quickly. Please wait a moment before trying again.";
+        } else {
+            userFriendlyMessage = "An unexpected error occurred. Please check the console for details.";
+        }
+        contentDiv.innerHTML = `<p>${userFriendlyMessage}</p>`;
+        aiMessageElement.classList.add('error-message');
+    }
+
+  } finally {
+    setFormState(true);
+  }
+}
+
+// --- Coding Sandbox Logic ---
+
+function findFileByName(name: string): SandboxFile | undefined {
+    return Object.values(codingSandboxState.files).find(f => f.name === name);
+}
+
+async function animateTyping(element: HTMLTextAreaElement, code: string) {
+    const charsPerSecond = (appSettings.typingWPM * 5) / 60;
+    const delay = 1000 / charsPerSecond;
+
+    return new Promise<void>(resolve => {
+        let i = 0;
+        function type() {
+            if (i < code.length) {
+                element.value = code.substring(0, i + 1);
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+                i++;
+                setTimeout(type, delay);
+            } else {
+                element.value = code; // Ensure final value is correct
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+                resolve();
+            }
+        }
+        type();
+    });
+}
+
+async function executeAiActions() {
+    if (!pendingAIActions) return;
+    sandboxContainer.style.display = 'flex';
+    for (const action of pendingAIActions) {
+        switch (action.action_type) {
+            case 'create_file': {
+                if (action.file_name && action.content !== undefined) {
+                    if (findFileByName(action.file_name)) {
+                         await updateSandboxFile(action.file_name, action.content);
+                    } else {
+                        await createSandboxFile(action.file_name, action.content, true);
+                    }
+                }
+                break;
+            }
+            case 'update_file': {
+                if (action.file_name && action.content !== undefined) {
+                    await updateSandboxFile(action.file_name, action.content);
+                }
+                break;
+            }
+            case 'delete_file': {
+                if (action.file_name) {
+                    const file = findFileByName(action.file_name);
+                    if (file) {
+                        deleteSandboxFile(file.id, true); // Skip confirmation when AI does it
+                    } else {
+                        console.warn(`AI tried to delete non-existent file: ${action.file_name}`);
+                    }
+                }
+                break;
+            }
+        }
+    }
+    pendingAIActions = null;
+    updateSandboxPreview();
+}
+
+async function createSandboxFile(fileName: string, content: string, fromAI = false): Promise<string> {
+    const id = `file_${Date.now()}_${Math.random()}`;
+    codingSandboxState.files[id] = { id, name: fileName, content: '' }; // Add empty first
+    renderSandboxTabs();
+    switchActiveSandboxFile(id);
+    if (fromAI) {
+        await animateTyping(sandboxCodeEditor, content);
+    } else {
+        sandboxCodeEditor.value = content;
+        sandboxCodeEditor.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    return id;
+}
+
+async function updateSandboxFile(fileName: string, content: string) {
+    const file = findFileByName(fileName);
+    if (file) {
+        switchActiveSandboxFile(file.id);
+        await animateTyping(sandboxCodeEditor, content);
+    } else {
+        await createSandboxFile(fileName, content, true);
+    }
+}
+
+function initializeCodingSandbox() {
+    renderSandboxTabs();
+    if (Object.keys(codingSandboxState.files).length > 0) {
+        const firstFileId = codingSandboxState.activeFileId || Object.keys(codingSandboxState.files)[0];
+        switchActiveSandboxFile(firstFileId);
+    } else {
+        switchActiveSandboxFile(null);
+    }
+    sandboxContainer.style.display = 'flex';
+    updateSandboxPreview();
+}
+
+function renderSandboxTabs() {
+    sandboxTabs.innerHTML = '';
+    Object.values(codingSandboxState.files).forEach(file => {
+        const tab = document.createElement('div');
+        tab.className = 'sandbox-tab';
+        tab.dataset.fileId = file.id;
+        tab.title = file.name;
+        tab.classList.toggle('active', file.id === codingSandboxState.activeFileId);
+        tab.innerHTML = `<span class="tab-name">${file.name}</span>`;
+        sandboxTabs.appendChild(tab);
+    });
+    sandboxTabs.appendChild(addFileButton);
+}
+
+function getLanguageFromFilename(filename: string): string {
+    const extension = filename.split('.').pop()?.toLowerCase();
+    switch (extension) {
+        case 'js': return 'javascript';
+        case 'css': return 'css';
+        case 'html': return 'markup';
+        case 'ts': return 'typescript';
+        case 'json': return 'json';
+        case 'md': return 'markdown';
+        default: return 'clike';
+    }
+}
+
+function switchActiveSandboxFile(fileId: string | null) {
+    if (!fileId || !codingSandboxState.files[fileId]) {
+        sandboxCodeEditor.value = '';
+        sandboxCodeHighlight.innerHTML = '';
+        codingSandboxState.activeFileId = null;
+        sandboxCodeEditor.disabled = true;
+    } else {
+        codingSandboxState.activeFileId = fileId;
+        const file = codingSandboxState.files[fileId];
+        const language = getLanguageFromFilename(file.name);
+        sandboxCodeEditor.disabled = false;
+        sandboxCodeEditor.value = file.content;
+        sandboxCodeHighlight.className = `language-${language}`;
+        sandboxCodeHighlight.textContent = file.content;
+        Prism.highlightElement(sandboxCodeHighlight);
+    }
+    document.querySelectorAll('.sandbox-tab').forEach(tab => {
+        tab.classList.toggle('active', tab.getAttribute('data-file-id') === fileId);
+    });
+}
+
+function addSandboxFile() {
+    const existingInput = sandboxTabs.querySelector('.add-file-input');
+    if (existingInput) {
+        (existingInput as HTMLElement).focus();
+        return;
+    }
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'add-file-input';
+    input.placeholder = 'new-file.html';
+    
+    const finish = () => {
+        const fileName = input.value.trim();
+        if (fileName) {
+            if (findFileByName(fileName)) {
+                showToast("A file with this name already exists.", 'error');
+            } else {
+                createSandboxFile(fileName, '').then(id => {
+                    switchActiveSandboxFile(id);
+                    sandboxCodeEditor.focus();
+                });
+            }
+        }
+        input.remove();
+    };
+
+    input.addEventListener('blur', finish);
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') input.blur();
+        if (e.key === 'Escape') {
+            input.remove();
+        }
+    });
+
+    sandboxTabs.insertBefore(input, addFileButton);
+    input.focus();
+}
+
+function deleteSandboxFile(fileId: string, skipConfirm = false) {
+    if (!codingSandboxState.files[fileId]) return;
+    const fileName = codingSandboxState.files[fileId].name;
+    
+    const performDelete = () => {
+        delete codingSandboxState.files[fileId];
+        renderSandboxTabs();
+        if (codingSandboxState.activeFileId === fileId) {
+            const nextFileId = Object.keys(codingSandboxState.files)[0] || null;
+            switchActiveSandboxFile(nextFileId);
+        }
+        updateSandboxPreview();
+    };
+
+    if (skipConfirm) {
+        performDelete();
+    } else {
+        showConfirmationModal(
+            'Delete File?',
+            `Are you sure you want to delete "${fileName}"? This cannot be undone.`,
+            performDelete
+        );
+    }
+}
+
+function renameSandboxFile(fileId: string, oldName: string) {
+    const tab = sandboxTabs.querySelector(`[data-file-id="${fileId}"] .tab-name`) as HTMLElement;
+    if (!tab) return;
+    
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'rename-input';
+    input.value = oldName;
+    tab.replaceWith(input);
+    input.focus();
+    input.select();
+    
+    const finishEditing = () => {
+        const newName = input.value.trim();
+        if (!newName || newName === oldName) {
+            renderSandboxTabs(); // Restore original
+            return;
+        }
+        if (findFileByName(newName)) {
+            showToast("A file with this name already exists.", 'error');
+            renderSandboxTabs(); // Restore original
+            return;
+        }
+        codingSandboxState.files[fileId].name = newName;
+        renderSandboxTabs();
+        updateSandboxPreview();
+    };
+
+    input.addEventListener('blur', finishEditing);
+    input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') (ev.target as HTMLInputElement).blur(); });
+}
+
+function updateSandboxPreview(targetFile: string = 'index.html') {
+    sandboxConsoleOutput.innerHTML = '';
+    codingSandboxState.previewFile = findFileByName(targetFile) ? targetFile : 'index.html';
+    
+    let html = `<div style="font-family: sans-serif; text-align: center; padding: 2rem;"><h2>404: Not Found</h2><p>Could not find <strong>${codingSandboxState.previewFile}</strong> in the sandbox.</p></div>`;
+    let css = '';
+    let js = '';
+    
+    const files = Object.values(codingSandboxState.files);
+    const htmlFile = files.find(f => f.name === codingSandboxState.previewFile);
+    
+    if (htmlFile) {
+        html = htmlFile.content;
+        sandboxPreviewTitle.textContent = `Preview: ${htmlFile.name}`;
+    } else {
+        sandboxPreviewTitle.textContent = 'Preview: Not Found';
+    }
+
+    files.forEach(f => {
+        if (f.name.endsWith('.css')) css += f.content;
+        if (f.name.endsWith('.js')) js += f.content;
+    });
+
+    const injectedScripts = `
+        const iframeConsole={log:(...a)=>window.parent.postMessage({type:"console",level:"log",message:a.map(b=>JSON.stringify(b,null,2)).join(" ")},"*"),error:(...a)=>window.parent.postMessage({type:"console",level:"error",message:a.map(b=>b?b.stack||JSON.stringify(b,null,2):'undefined').join(" ")},"*"),warn:(...a)=>window.parent.postMessage({type:"console",level:"warn",message:a.map(b=>JSON.stringify(b,null,2)).join(" ")},"*")};
+        window.console={...window.console,...iframeConsole};
+        window.addEventListener("error",e=>iframeConsole.error(e.message,'at',e.filename+':'+e.lineno));
+        document.addEventListener('click', e => {
+            const link = e.target.closest('a');
+            if (link && link.href) {
+                const url = new URL(link.href);
+                if (url.origin === window.location.origin && !link.hash) {
+                    e.preventDefault();
+                    const targetFile = url.pathname.startsWith('/') ? url.pathname.substring(1) : url.pathname;
+                    window.parent.postMessage({type: 'sandbox_nav', file: targetFile}, '*');
+                }
+            }
+        });
+        try{${js}}catch(e){iframeConsole.error(e)}
+    `;
+
+    const srcDoc = `<!DOCTYPE html><html><head><style>${css}</style></head><body>${html}<script>${injectedScripts}<\/script></body></html>`;
+    sandboxPreviewIframe.srcdoc = srcDoc;
+}
+
+function logToSandboxConsole(level: 'log' | 'error' | 'warn', message: string) {
+    const entry = document.createElement('div');
+    entry.className = `log-entry log-${level}`;
+    const messageSpan = document.createElement('span');
+    messageSpan.textContent = message;
+    entry.appendChild(messageSpan);
+    if (level === 'error') {
+        const fixButton = document.createElement('button');
+        fixButton.className = 'fix-error-button';
+        fixButton.textContent = 'Fix with AI';
+        fixButton.title = 'Ask AI to fix this error';
+        fixButton.dataset.errorMessage = message;
+        entry.appendChild(fixButton);
+    }
+    sandboxConsoleOutput.appendChild(entry);
+    sandboxConsoleOutput.scrollTop = sandboxConsoleOutput.scrollHeight;
+}
+
+
+// --- Modal & Settings Logic ---
+function showAiActionConfirmation(actions: AIFileAction[]) {
+    pendingAIActions = actions;
+    aiActionList.innerHTML = actions.map(action => {
+        const tagClass = action.action_type.split('_')[0];
+        return `<li class="ai-action-item">
+            <span class="ai-action-tag ${tagClass}">${tagClass.toUpperCase()}</span>
+            <span>${action.file_name}</span>
+        </li>`;
+    }).join('');
+    aiActionModal.style.display = 'flex';
+}
+
+function hideAiActionConfirmation() {
+    aiActionModal.style.display = 'none';
+    pendingAIActions = null;
+}
+
+function showConfirmationModal(title: string, text: string, onConfirm: () => void) {
+    confirmModalTitle.textContent = title;
+    confirmModalText.textContent = text;
+    
+    let confirmHandler: () => void;
+    const hide = () => {
+        confirmModal.style.display = 'none';
+        confirmModalConfirm.removeEventListener('click', confirmHandler);
+    };
+    confirmHandler = () => {
+        onConfirm();
+        hide();
+    };
+    confirmModal.style.display = 'flex';
+    confirmModalConfirm.addEventListener('click', confirmHandler, { once: true });
+    confirmModalCancel.addEventListener('click', hide, { once: true });
+    confirmModal.addEventListener('click', (e) => {
+        if (e.target === confirmModal) hide();
+    }, { once: true });
+}
+
+function showClearHistoryModal() {
+    confirmClearInput.value = '';
+    confirmClearButton.disabled = true;
+    clearHistoryModal.style.display = 'flex';
+    confirmClearInput.focus();
+}
+
+function hideClearHistoryModal() {
+    clearHistoryModal.style.display = 'none';
+}
+
+function showSettingsModal() {
+    themeSelector.value = appSettings.theme;
+    temperatureSlider.value = String(appSettings.temperature);
+    temperatureValue.textContent = String(appSettings.temperature);
+    typingSpeedSlider.value = String(appSettings.typingWPM);
+    typingSpeedValue.textContent = String(appSettings.typingWPM);
+    settingsModal.style.display = 'flex';
+}
+
+function hideSettingsModal() {
+    settingsModal.style.display = 'none';
+}
+
+function applyTheme() {
+    document.body.className = appSettings.theme === 'light' ? 'light-theme' : '';
+    const prismLink = document.querySelector<HTMLLinkElement>('link[href*="prism"]');
+    if (prismLink) {
+        prismLink.href = appSettings.theme === 'light'
+            ? 'https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism.min.css'
+            : 'https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css';
+    }
+}
+
+// --- Event Listeners ---
+function setupSandboxListeners() {
+    closeSandboxButton.addEventListener('click', () => sandboxContainer.style.display = 'none');
+    runCodeButton.addEventListener('click', () => updateSandboxPreview());
+    addFileButton.addEventListener('click', addSandboxFile);
+    fullscreenButton.addEventListener('click', () => {
+        sandboxPreviewPanel.classList.toggle('fullscreen');
+        fullscreenButton.querySelector('i')?.classList.toggle('fa-expand');
+        fullscreenButton.querySelector('i')?.classList.toggle('fa-compress');
+    });
+
+    sandboxTabs.addEventListener('click', (e) => {
+        const target = e.target as HTMLElement;
+        const tab = target.closest<HTMLElement>('.sandbox-tab');
+        if (!tab || !tab.dataset.fileId) return;
+        switchActiveSandboxFile(tab.dataset.fileId);
+    });
+
+    sandboxTabs.addEventListener('contextmenu', (e) => {
+        const tab = (e.target as HTMLElement).closest<HTMLElement>('.sandbox-tab');
+        if (!tab || !tab.dataset.fileId) return;
+        e.preventDefault();
+        contextMenuFileId = tab.dataset.fileId;
+        sandboxContextMenu.style.display = 'block';
+        sandboxContextMenu.style.left = `${e.clientX}px`;
+        sandboxContextMenu.style.top = `${e.clientY}px`;
+    });
+    
+    contextRename.addEventListener('click', () => {
+        if (contextMenuFileId && codingSandboxState.files[contextMenuFileId]) {
+            renameSandboxFile(contextMenuFileId, codingSandboxState.files[contextMenuFileId].name);
+        }
+    });
+
+    contextDelete.addEventListener('click', () => {
+        if (contextMenuFileId) deleteSandboxFile(contextMenuFileId);
+    });
+
+    document.addEventListener('click', () => {
+        sandboxContextMenu.style.display = 'none';
+        contextMenuFileId = null;
+    });
+
+    sandboxCodeEditor.addEventListener('input', () => {
+        if (!codingSandboxState.activeFileId) return;
+        const content = sandboxCodeEditor.value;
+        codingSandboxState.files[codingSandboxState.activeFileId].content = content;
+        sandboxCodeHighlight.textContent = content;
+        Prism.highlightElement(sandboxCodeHighlight);
+    });
+    
+    sandboxCodeEditor.addEventListener('scroll', () => {
+        sandboxCodePre.scrollTop = sandboxCodeEditor.scrollTop;
+        sandboxCodePre.scrollLeft = sandboxCodeEditor.scrollLeft;
+    });
+
+    window.addEventListener('message', (e) => {
+        if (e.data?.type === 'console') logToSandboxConsole(e.data.level, e.data.message);
+        if (e.data?.type === 'sandbox_nav') updateSandboxPreview(e.data.file);
+    });
+
+    sandboxConsoleOutput.addEventListener('click', e => {
+        const target = e.target as HTMLElement;
+        const button = target.closest<HTMLButtonElement>('.fix-error-button');
+        if (button && button.dataset.errorMessage) {
+            const prompt = `The code produced this error: "${button.dataset.errorMessage}". Please analyze the files and provide actions to fix it.`;
+            handleSendMessage(prompt);
+        }
+    });
+
+    let isResizing = false;
+    sandboxResizer.addEventListener('mousedown', () => {
+        isResizing = true;
+        document.body.style.cursor = 'col-resize';
+        document.body.style.userSelect = 'none';
+        const mouseMoveHandler = (moveEvent: MouseEvent) => {
+            if (!isResizing) return;
+            const containerRect = sandboxContainer.getBoundingClientRect();
+            const newEditorWidth = moveEvent.clientX - containerRect.left;
+            (sandboxResizer.previousElementSibling as HTMLElement).style.flex = `0 0 ${newEditorWidth}px`;
+        };
+        const mouseUpHandler = () => {
+            isResizing = false;
+            document.body.style.cursor = 'default';
+            document.body.style.userSelect = 'auto';
+            window.removeEventListener('mousemove', mouseMoveHandler);
+            window.removeEventListener('mouseup', mouseUpHandler);
+        };
+        window.addEventListener('mousemove', mouseMoveHandler);
+        window.addEventListener('mouseup', mouseUpHandler);
+    });
+}
+
+
+function setupEventListeners() {
+    chatForm.addEventListener('submit', handleSendMessage);
+    newChatButton.addEventListener('click', startNewChat);
+
+    chatInput.addEventListener('input', () => {
+        chatInput.style.height = 'auto';
+        chatInput.style.height = `${chatInput.scrollHeight}px`;
+    });
+
+    chatInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            chatForm.requestSubmit();
+        }
+    });
+
+    chatTitle.addEventListener('dblclick', () => {
+        if (!currentChatId) return;
+        const oldTitle = chatTitle.textContent ?? '';
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'chat-title-input';
+        input.value = oldTitle;
+        chatTitle.replaceWith(input);
+        input.focus();
+        input.select();
+        
+        const finish = () => {
+            const newTitle = input.value.trim();
+            input.replaceWith(chatTitle);
+            if (newTitle && newTitle !== oldTitle) {
+                renameChat(currentChatId!, newTitle);
+            } else {
+                chatTitle.textContent = oldTitle;
+            }
+        };
+        input.addEventListener('blur', finish);
+        input.addEventListener('keydown', e => { if (e.key === 'Enter') input.blur(); });
+    });
+
+    searchToggle.addEventListener('change', () => { if (searchToggle.checked) codingToggle.checked = false; });
+    codingToggle.addEventListener('change', () => {
+        if (codingToggle.checked) {
+            searchToggle.checked = false;
+            initializeCodingSandbox();
+        } else {
+            sandboxContainer.style.display = 'none';
+        }
+    });
+
+    historyList.addEventListener('click', (e) => {
+        const target = e.target as HTMLElement;
+        const historyItem = target.closest<HTMLElement>('.history-item');
+        if (!historyItem?.dataset.id) return;
+        const chatId = historyItem.dataset.id;
+        if (target.closest('.delete-chat-button')) {
+            e.stopPropagation();
+            deleteChat(chatId);
+            return;
+        }
+        if (target.closest('.history-title-input')) {
+            return; // Don't load chat if clicking the input field
+        }
+        loadChat(chatId);
+    });
+    
+    historyList.addEventListener('dblclick', (e) => {
+        const target = e.target as HTMLElement;
+        const historyItem = target.closest<HTMLElement>('.history-item');
+        const titleSpan = historyItem?.querySelector('span');
+
+        if (!historyItem || !titleSpan || !historyItem.dataset.id || historyItem.querySelector('.history-title-input')) return;
+
+        const chatId = historyItem.dataset.id;
+        const oldTitle = allChats[chatId].title;
+
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'history-title-input';
+        input.value = oldTitle;
+
+        titleSpan.style.display = 'none';
+        // Insert input before the delete button if it exists
+        const deleteButton = historyItem.querySelector('.delete-chat-button');
+        historyItem.insertBefore(input, deleteButton);
+        input.focus();
+        input.select();
+
+        const finish = () => {
+            const newTitle = input.value.trim();
+            input.remove();
+            titleSpan.style.display = '';
+            if (newTitle && newTitle !== oldTitle) {
+                renameChat(chatId, newTitle); // This will re-render everything
+            }
+        };
+        input.addEventListener('blur', finish);
+        input.addEventListener('keydown', (ev) => {
+            if (ev.key === 'Enter') input.blur();
+            if (ev.key === 'Escape') { input.value = oldTitle; input.blur(); }
+        });
+    });
+
+
+    // Modals
+    clearHistoryButton.addEventListener('click', showClearHistoryModal);
+    cancelClearButton.addEventListener('click', hideClearHistoryModal);
+    clearHistoryModal.addEventListener('click', (e) => { if (e.target === clearHistoryModal) hideClearHistoryModal(); });
+    confirmClearInput.addEventListener('input', () => { confirmClearButton.disabled = confirmClearInput.value.trim() !== CONFIRMATION_PHRASE; });
+    confirmClearButton.addEventListener('click', () => {
+        performClearAllHistory();
+        hideClearHistoryModal();
+    });
+    
+    settingsButton.addEventListener('click', showSettingsModal);
+    closeSettingsButton.addEventListener('click', hideSettingsModal);
+    settingsModal.addEventListener('click', (e) => { if (e.target === settingsModal) hideSettingsModal(); });
+    themeSelector.addEventListener('change', () => {
+        appSettings.theme = themeSelector.value as 'dark' | 'light';
+        saveSettings();
+        applyTheme();
+    });
+    temperatureSlider.addEventListener('input', () => {
+        appSettings.temperature = parseFloat(temperatureSlider.value);
+        temperatureValue.textContent = temperatureSlider.value;
+    });
+    temperatureSlider.addEventListener('change', saveSettings);
+    typingSpeedSlider.addEventListener('input', () => {
+        appSettings.typingWPM = parseInt(typingSpeedSlider.value, 10);
+        typingSpeedValue.textContent = typingSpeedSlider.value;
+    });
+    typingSpeedSlider.addEventListener('change', saveSettings);
+
+    clearSandboxButton.addEventListener('click', () => {
+        showConfirmationModal("Clear Sandbox?", "Are you sure you want to delete all files in the sandbox? This cannot be undone.", () => {
+            codingSandboxState = { activeFileId: null, files: {}, previewFile: 'index.html' };
+            initializeCodingSandbox();
+        });
+    });
+
+    exportZipButton.addEventListener('click', async () => {
+        if (Object.keys(codingSandboxState.files).length === 0) {
+            showToast("Sandbox is empty. Nothing to export.", 'info');
+            return;
+        }
+        const zip = new JSZip();
+        Object.values(codingSandboxState.files).forEach(file => {
+            zip.file(file.name, file.content);
+        });
+        const blob = await zip.generateAsync({ type: "blob" });
+        saveAs(blob, "gemini-sandbox-project.zip");
+        hideSettingsModal();
+    });
+
+    allowAiActionButton.addEventListener('click', () => {
+        executeAiActions();
+        hideAiActionConfirmation();
+    });
+    denyAiActionButton.addEventListener('click', hideAiActionConfirmation);
+    aiActionModal.addEventListener('click', e => { if (e.target === aiActionModal) hideAiActionConfirmation() });
+}
+
+// Initialize the application
+initializeApp();
