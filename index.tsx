@@ -73,6 +73,12 @@ const sandboxContextMenu = document.getElementById('sandbox-context-menu') as HT
 const contextRename = document.getElementById('context-rename') as HTMLLIElement;
 const contextDelete = document.getElementById('context-delete') as HTMLLIElement;
 
+// Message Context Menu
+const messageContextMenu = document.getElementById('message-context-menu') as HTMLElement;
+const messageContextCopy = document.getElementById('message-context-copy') as HTMLLIElement;
+const messageContextCopyRaw = document.getElementById('message-context-copy-raw') as HTMLLIElement;
+const messageContextRetry = document.getElementById('message-context-retry') as HTMLLIElement;
+
 // AI Action Modal
 const aiActionModal = document.getElementById('ai-action-modal') as HTMLElement;
 const aiActionList = document.getElementById('ai-action-list') as HTMLUListElement;
@@ -138,6 +144,7 @@ let appSettings: AppSettings = { theme: 'dark', temperature: 0.5, typingWPM: 155
 const CONFIRMATION_PHRASE = "Clear all of my chat history";
 let pendingAIActions: AIFileAction[] | null = null;
 let contextMenuFileId: string | null = null;
+let contextMenuMessageElement: HTMLElement | null = null;
 let originalUserMessageForSandboxRequest: string | null = null;
 
 
@@ -326,7 +333,7 @@ function loadChat(id: string) {
   if (chat.history.length === 0) {
     appendMessage('ai', { displayText: 'Hello! I\'m Gemini. How can I assist you today?'});
   } else {
-     chat.history.forEach(item => {
+     chat.history.forEach((item, index) => {
         const role = item.role === 'user' ? 'user' : 'ai';
         let content: AIResponse;
         try {
@@ -343,7 +350,8 @@ function loadChat(id: string) {
             const rawText = (item.parts[0] as {text: string}).text || '';
             content = { displayText: rawText };
         }
-        appendMessage(role, content);
+        const messageElement = appendMessage(role, content);
+        messageElement.dataset.historyIndex = String(index);
     });
   }
   
@@ -597,14 +605,19 @@ async function handleSendMessage(event: Event | string) {
   setFormState(false);
   // Only add a new user message if it's not a re-send from the sandbox modal
   if (typeof event !== 'string' || event !== originalUserMessageForSandboxRequest) {
-    appendMessage('user', { displayText: messageText });
     const userMessageContent: Content = { role: 'user', parts: [{ text: messageText }] };
     allChats[currentChatId].history.push(userMessageContent);
+    const userMessageIndex = allChats[currentChatId].history.length - 1;
+    const userMessageElement = appendMessage('user', { displayText: messageText });
+    userMessageElement.dataset.historyIndex = String(userMessageIndex);
   }
   chatInput.value = '';
   chatInput.style.height = 'auto';
 
   const aiMessageElement = appendMessage('ai', {displayText: ''});
+  const aiMessageIndex = allChats[currentChatId].history.length;
+  aiMessageElement.dataset.historyIndex = String(aiMessageIndex);
+  
   const thinkingIndicator = document.createElement('div');
   thinkingIndicator.className = 'thinking-indicator';
   thinkingIndicator.innerHTML = '<span></span><span></span><span></span>';
@@ -629,12 +642,14 @@ async function handleSendMessage(event: Event | string) {
             .map(f => `// file: ${f.name}\n${f.content}`)
             .join('\n\n---\n\n');
         
-        const systemInstruction = `You are an expert AI assistant integrated into a coding sandbox. You can handle any programming language or file type. Analyze file names (e.g., .py, .js, .html, .css) and their content to understand the project's context and respond appropriately in the correct language. Your task is to help the user with their request by generating a sequence of file operations. Analyze the user's request and the provided file content. Be concise. Only modify what is necessary. 
+        const systemInstruction = `You are an expert AI assistant integrated into a coding sandbox. You can handle any programming language or file type. Analyze file names (e.g., .py, .js, .html, .css) and their content to understand the project's context and respond appropriately. Your task is to help the user with their request by generating a sequence of file operations. Analyze the user's request and the provided file content. Be concise. Only modify what is necessary.
         
-        Your response MUST be a single JSON object that strictly follows the provided schema. The \`displayText\` property should be a helpful explanation of the changes. Do NOT include any markdown code blocks in the \`displayText\` property. All code must be delivered via file \`actions\`.
+Important: The sandbox preview environment is client-side only (HTML, CSS, JavaScript). Server-side languages like PHP or Python will not execute in the preview, so do not suggest server-side solutions unless specifically asked about backend code.
+        
+Your response MUST be a single JSON object that strictly follows the provided schema. The \`displayText\` property should be a helpful explanation of the changes. Do NOT include any markdown code blocks in the \`displayText\` property. All code must be delivered via file \`actions\`.
 
-        CURRENT FILES IN SANDBOX:
-        ${filesContext || "(No files in sandbox yet)"}`;
+CURRENT FILES IN SANDBOX:
+${filesContext || "(No files in sandbox yet)"}`;
         
         request = {
             model: 'gemini-2.5-flash',
@@ -912,6 +927,11 @@ function switchActiveSandboxFile(fileId: string | null) {
     document.querySelectorAll('.sandbox-tab').forEach(tab => {
         tab.classList.toggle('active', tab.getAttribute('data-file-id') === fileId);
     });
+
+    const activeTabEl = sandboxTabs.querySelector(`.sandbox-tab[data-file-id="${fileId}"]`);
+    if (activeTabEl) {
+        activeTabEl.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
+    }
 }
 
 function addSandboxFile() {
@@ -1225,7 +1245,9 @@ function setupSandboxListeners() {
 
     document.addEventListener('click', () => {
         sandboxContextMenu.style.display = 'none';
+        messageContextMenu.style.display = 'none';
         contextMenuFileId = null;
+        contextMenuMessageElement = null;
     });
 
     sandboxCodeEditor.addEventListener('input', () => {
@@ -1253,7 +1275,7 @@ function setupSandboxListeners() {
         if (button && button.dataset.errorMessage) {
             codingToggle.checked = true;
             codingToggle.dispatchEvent(new Event('change'));
-            const prompt = `The code produced this error: "${button.dataset.errorMessage}". Please analyze the files and provide actions to fix it.`;
+            const prompt = `The code in the sandbox produced this error: "${button.dataset.errorMessage}". You are an expert software engineer. Your task is to analyze all the files in the current sandbox context, identify the root cause of the error, and provide a fix. Explain the problem clearly in the displayText before providing the file actions. Remember, the preview environment is client-side only (HTML, CSS, JavaScript); server-side code like PHP will not execute.`;
             handleSendMessage(prompt);
         }
     });
@@ -1389,6 +1411,63 @@ function setupEventListeners() {
             if (ev.key === 'Enter') input.blur();
             if (ev.key === 'Escape') { input.value = oldTitle; input.blur(); }
         });
+    });
+
+    // Message Context Menu
+    chatContainer.addEventListener('contextmenu', (e) => {
+        const messageEl = (e.target as HTMLElement).closest<HTMLElement>('.message');
+        if (!messageEl || !currentChatId) return;
+        
+        e.preventDefault();
+        contextMenuMessageElement = messageEl;
+        const historyIndex = parseInt(messageEl.dataset.historyIndex || '-1', 10);
+        const isAiMessage = messageEl.classList.contains('ai-message');
+        const isLastMessage = messageEl === chatContainer.lastElementChild;
+        
+        messageContextCopyRaw.classList.toggle('hidden', !isAiMessage);
+        messageContextRetry.classList.toggle('hidden', !(isAiMessage && isLastMessage));
+        
+        messageContextMenu.style.display = 'block';
+        messageContextMenu.style.left = `${e.clientX}px`;
+        messageContextMenu.style.top = `${e.clientY}px`;
+    });
+    
+    messageContextCopy.addEventListener('click', () => {
+        if (!contextMenuMessageElement) return;
+        const content = contextMenuMessageElement.querySelector('.message-content')?.innerText || '';
+        navigator.clipboard.writeText(content).then(() => showToast('Copied to clipboard!', 'success'));
+    });
+
+    messageContextCopyRaw.addEventListener('click', () => {
+        if (!contextMenuMessageElement || !currentChatId) return;
+        const historyIndex = parseInt(contextMenuMessageElement.dataset.historyIndex || '-1', 10);
+        if (historyIndex > -1) {
+            const historyItem = allChats[currentChatId].history[historyIndex];
+            if (historyItem) {
+                const rawText = (historyItem.parts[0] as {text: string}).text;
+                navigator.clipboard.writeText(rawText).then(() => showToast('Copied raw JSON!', 'success'));
+            }
+        }
+    });
+
+    messageContextRetry.addEventListener('click', () => {
+        if (!currentChatId) return;
+        const history = allChats[currentChatId].history;
+        if (history.length >= 2 && history[history.length - 1].role === 'model') {
+            // Pop the AI response and the user prompt
+            history.pop();
+            const lastUserPrompt = history.pop();
+            
+            if (lastUserPrompt && lastUserPrompt.role === 'user') {
+                const promptText = (lastUserPrompt.parts[0] as { text: string }).text;
+                // Remove the last two message elements from the DOM
+                if(chatContainer.lastChild) chatContainer.lastChild.remove();
+                if(chatContainer.lastChild) chatContainer.lastChild.remove();
+                saveChatsToStorage();
+                // Resend the prompt
+                handleSendMessage(promptText);
+            }
+        }
     });
 
 
