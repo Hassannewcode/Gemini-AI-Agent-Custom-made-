@@ -1434,7 +1434,7 @@ function setupEventListeners() {
     
     messageContextCopy.addEventListener('click', () => {
         if (!contextMenuMessageElement) return;
-        const content = contextMenuMessageElement.querySelector('.message-content')?.innerText || '';
+        const content = (contextMenuMessageElement.querySelector('.message-content') as HTMLElement)?.innerText || '';
         navigator.clipboard.writeText(content).then(() => showToast('Copied to clipboard!', 'success'));
     });
 
