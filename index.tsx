@@ -76,6 +76,12 @@ const aiActionList = document.getElementById('ai-action-list') as HTMLUListEleme
 const allowAiActionButton = document.getElementById('allow-ai-action-button') as HTMLButtonElement;
 const denyAiActionButton = document.getElementById('deny-ai-action-button') as HTMLButtonElement;
 
+// Request Sandbox Modal
+const requestSandboxModal = document.getElementById('request-sandbox-modal') as HTMLElement;
+const cancelSandboxRequestButton = document.getElementById('cancel-sandbox-request-button') as HTMLButtonElement;
+const confirmSandboxRequestButton = document.getElementById('confirm-sandbox-request-button') as HTMLButtonElement;
+
+
 // Settings Modal
 const settingsButton = document.getElementById('settings-button') as HTMLButtonElement;
 const settingsModal = document.getElementById('settings-modal') as HTMLElement;
@@ -95,16 +101,22 @@ type AppSettings = {
     temperature: number;
     typingWPM: number;
 };
+type SandboxFile = {
+    id: string;
+    name: string;
+    content: string;
+};
+type SandboxState = {
+    activeFileId: string | null;
+    files: Record<string, SandboxFile>;
+    previewFile: string;
+};
 type ChatSession = {
   id: string;
   title: string;
   createdAt: number;
   history: Content[];
-};
-type SandboxFile = {
-    id: string;
-    name: string;
-    content: string;
+  sandboxState: SandboxState;
 };
 type AIFileAction = {
     action_type: 'create_file' | 'update_file' | 'delete_file';
@@ -122,23 +134,21 @@ let appSettings: AppSettings = { theme: 'dark', temperature: 0.5, typingWPM: 155
 const CONFIRMATION_PHRASE = "Clear all of my chat history";
 let pendingAIActions: AIFileAction[] | null = null;
 let contextMenuFileId: string | null = null;
+let originalUserMessageForSandboxRequest: string | null = null;
 
-let codingSandboxState: {
-    activeFileId: string | null;
-    files: Record<string, SandboxFile>;
-    previewFile: string;
-} = {
+
+let codingSandboxState: SandboxState = {
     activeFileId: null,
     files: {},
     previewFile: 'index.html'
 };
 
-const responseSchema = {
+const sandboxActionSchema = {
     type: Type.OBJECT,
     properties: {
         displayText: {
             type: Type.STRING,
-            description: "A short, helpful explanation of the changes you are making for the user. This is always required."
+            description: "A short, helpful explanation of the changes you are making for the user. This is always required. Do NOT include any markdown code blocks in this property; all code must be in the 'actions' property."
         },
         actions: {
             type: Type.ARRAY,
@@ -167,6 +177,22 @@ const responseSchema = {
         }
     }
 };
+
+const regularChatResponseSchema = {
+    type: Type.OBJECT,
+    properties: {
+        displayText: {
+            type: Type.STRING,
+            description: "Your text response to the user, formatted in markdown."
+        },
+        request_enable_sandbox: {
+            type: Type.BOOLEAN,
+            nullable: true,
+            description: "Set to true if you believe the user's request is best handled in the interactive coding sandbox. Otherwise, omit or set to false."
+        }
+    }
+};
+
 
 // --- State Management and Initialization ---
 
@@ -197,34 +223,24 @@ function saveChatsToStorage() {
   }
 }
 
-function saveSandboxState() {
-    try {
-        localStorage.setItem('gemini-sandbox-state', JSON.stringify(codingSandboxState));
-    } catch (e) {
-        console.error("Failed to save sandbox state.", e);
-        showToast("Could not save sandbox state. Storage might be full.", 'error');
-    }
-}
-
-function loadSandboxState() {
-    const storedState = localStorage.getItem('gemini-sandbox-state');
-    if (storedState) {
-        try {
-            const parsedState = JSON.parse(storedState);
-            if (parsedState && typeof parsedState.files === 'object') {
-                 codingSandboxState = parsedState;
-            }
-        } catch (e) {
-            console.error("Failed to parse sandbox state from storage.", e);
+function persistSandboxStateToCurrentChat() {
+    if (currentChatId && allChats[currentChatId]) {
+        // Ensure sandboxState exists before assigning
+        if (!allChats[currentChatId].sandboxState) {
+             allChats[currentChatId].sandboxState = { activeFileId: null, files: {}, previewFile: 'index.html' };
         }
+        allChats[currentChatId].sandboxState = JSON.parse(JSON.stringify(codingSandboxState));
+        saveChatsToStorage();
     }
 }
 
 
 function initializeApp() {
+  // Migration: remove old separate sandbox state if it exists
+  localStorage.removeItem('gemini-sandbox-state');
+  
   loadSettings();
   loadChatsFromStorage();
-  loadSandboxState();
   applyTheme();
   renderChatHistory();
   const latestChatId = Object.keys(allChats).sort((a, b) => allChats[b].createdAt - allChats[a].createdAt)[0];
@@ -235,9 +251,12 @@ function initializeApp() {
   }
   setupEventListeners();
   setupSandboxListeners();
-  renderSandboxTabs();
+  
+  // Initial UI state based on toggle
   if (codingToggle.checked) {
-    initializeCodingSandbox();
+    sandboxContainer.style.display = 'flex';
+  } else {
+    sandboxContainer.style.display = 'none';
   }
 }
 
@@ -250,6 +269,11 @@ function startNewChat() {
     title: 'New Chat',
     createdAt: Date.now(),
     history: [],
+    sandboxState: {
+        activeFileId: null,
+        files: {},
+        previewFile: 'index.html'
+    }
   };
   allChats[newId] = newChat;
   saveChatsToStorage();
@@ -261,10 +285,29 @@ function loadChat(id: string) {
   if (!allChats[id]) return;
   currentChatId = id;
   const chat = allChats[id];
+  
+  // --- SANDBOX STATE MIGRATION & LOADING ---
+  if (!chat.sandboxState) {
+      chat.sandboxState = { activeFileId: null, files: {}, previewFile: 'index.html' };
+  }
+  // Use a deep copy to prevent mutation issues
+  codingSandboxState = JSON.parse(JSON.stringify(chat.sandboxState));
+  renderSandboxTabs();
+  // Ensure the UI reflects the loaded state correctly
+  if (codingSandboxState.activeFileId && codingSandboxState.files[codingSandboxState.activeFileId]) {
+      switchActiveSandboxFile(codingSandboxState.activeFileId);
+  } else {
+      const firstFileId = Object.keys(codingSandboxState.files)[0] || null;
+      switchActiveSandboxFile(firstFileId);
+  }
+  updateSandboxPreview();
+
   chatContainer.innerHTML = '';
   cloudBrowserPreview.style.display = 'none';
-  sandboxContainer.style.display = 'none';
+  
+  // Reset toggles to a neutral state, will be updated by history or user
   codingToggle.checked = false;
+  sandboxContainer.style.display = 'none';
 
   if (chat.history.length === 0) {
     appendMessage('ai', { displayText: 'Hello! I\'m Gemini. How can I assist you today?'});
@@ -275,7 +318,9 @@ function loadChat(id: string) {
         try {
             const textContent = (item.parts[0] as {text: string}).text;
             if (role === 'ai') {
-                content = JSON.parse(textContent);
+                const parsed = JSON.parse(textContent);
+                // Handle both old and new formats
+                content = typeof parsed === 'object' && parsed.displayText !== undefined ? parsed : { displayText: textContent };
             } else {
                 content = { displayText: textContent };
             }
@@ -468,16 +513,16 @@ async function animateAiResponse(messageElement: HTMLElement, markdownText: stri
     const contentDiv = messageElement.querySelector('.message-content') as HTMLElement;
     if (!contentDiv) return;
 
-    // Instantly render for performance if WPM is very high
-    if (appSettings.typingWPM >= 1500) {
+    const charsPerSecond = (appSettings.typingWPM * 5) / 60; // 5 chars per word on average
+    const delay = 1000 / charsPerSecond;
+
+    // Instantly render for performance if delay is too short (sub-4ms is unreliable for setTimeout)
+    if (delay < 4 || appSettings.typingWPM > 3000) {
         contentDiv.innerHTML = marked.parse(markdownText) as string;
         Prism.highlightAllUnder(contentDiv);
         chatContainer.scrollTop = chatContainer.scrollHeight;
         return;
     }
-
-    const charsPerSecond = (appSettings.typingWPM * 5) / 60; // 5 chars per word on average
-    const delay = 1000 / charsPerSecond;
 
     let currentText = '';
     const cursorSpan = '<span class="typing-cursor"></span>';
@@ -536,9 +581,12 @@ async function handleSendMessage(event: Event | string) {
   if (!messageText) return;
 
   setFormState(false);
-  appendMessage('user', { displayText: messageText });
-  const userMessageContent: Content = { role: 'user', parts: [{ text: messageText }] };
-  allChats[currentChatId].history.push(userMessageContent);
+  // Only add a new user message if it's not a re-send from the sandbox modal
+  if (typeof event !== 'string' || event !== originalUserMessageForSandboxRequest) {
+    appendMessage('user', { displayText: messageText });
+    const userMessageContent: Content = { role: 'user', parts: [{ text: messageText }] };
+    allChats[currentChatId].history.push(userMessageContent);
+  }
   chatInput.value = '';
   chatInput.style.height = 'auto';
 
@@ -567,7 +615,9 @@ async function handleSendMessage(event: Event | string) {
             .map(f => `// file: ${f.name}\n${f.content}`)
             .join('\n\n---\n\n');
         
-        const systemInstruction = `You are an expert AI assistant integrated into a coding sandbox. You can handle any programming language or file type. Analyze file names (e.g., .py, .js, .html, .css) and their content to understand the project's context and respond appropriately in the correct language. Your task is to help the user with their request by generating a sequence of file operations. Analyze the user's request and the provided file content. Be concise. Only modify what is necessary. Your response MUST be a single JSON object that strictly follows the provided schema. Do NOT write any text or explanation outside of this JSON object.
+        const systemInstruction = `You are an expert AI assistant integrated into a coding sandbox. You can handle any programming language or file type. Analyze file names (e.g., .py, .js, .html, .css) and their content to understand the project's context and respond appropriately in the correct language. Your task is to help the user with their request by generating a sequence of file operations. Analyze the user's request and the provided file content. Be concise. Only modify what is necessary. 
+        
+        Your response MUST be a single JSON object that strictly follows the provided schema. The \`displayText\` property should be a helpful explanation of the changes. Do NOT include any markdown code blocks in the \`displayText\` property. All code must be delivered via file \`actions\`.
 
         CURRENT FILES IN SANDBOX:
         ${filesContext || "(No files in sandbox yet)"}`;
@@ -578,75 +628,77 @@ async function handleSendMessage(event: Event | string) {
             config: {
                 systemInstruction: systemInstruction,
                 responseMimeType: "application/json",
-                responseSchema: responseSchema,
+                responseSchema: sandboxActionSchema,
                 ...modelConfig
             }
         };
-    } else {
-        const systemInstruction = `You are an advanced AI agent, Gemini. Your goal is to provide helpful and well-formatted text answers using markdown.`;
+    } else { // Regular Chat
+        const systemInstruction = `You are an advanced AI agent, Gemini. Your goal is to provide helpful and well-formatted text answers using markdown. If the user asks for a coding task (e.g., writing, modifying, or explaining code), you can suggest enabling the interactive coding sandbox by setting 'request_enable_sandbox' to true in your JSON response.`;
         request = {
             model: 'gemini-2.5-flash',
             contents: [...allChats[currentChatId].history],
-            config: { systemInstruction, ...modelConfig }
+            config: {
+                systemInstruction,
+                responseMimeType: "application/json",
+                responseSchema: regularChatResponseSchema,
+                ...modelConfig
+            }
         };
     }
 
-    // --- Make API Call (Non-streaming) ---
     const response = await ai.models.generateContent(request);
     const fullResponseText = response.text;
     
     thinkingIndicator.remove();
+    cloudBrowserPreview.style.display = 'none';
 
-    // --- Post-process and Animate Response ---
     let aiResponse: AIResponse;
+    let parsedResponse: any;
 
-    if (useSearch) {
-        aiResponse = { displayText: fullResponseText };
-        const groundingMetadata = response?.candidates?.[0]?.groundingMetadata;
-        if (groundingMetadata?.groundingChunks && groundingMetadata.groundingChunks.length > 0) {
-            renderCloudBrowserPreview('results', groundingMetadata.groundingChunks);
+    try {
+        parsedResponse = JSON.parse(fullResponseText);
+    } catch (e) {
+        console.error("Failed to parse AI JSON response:", e, "\nResponse text:", fullResponseText);
+        const jsonMatch = fullResponseText.match(/```json\s*([\s\S]*?)\s*```/);
+        if (jsonMatch && jsonMatch[1]) {
+            try {
+                parsedResponse = JSON.parse(jsonMatch[1]);
+            } catch (e2) {
+                 showToast("AI returned malformed JSON.", 'error');
+                 parsedResponse = { displayText: `I encountered an error formatting my response. Here's the raw text:\n\n${fullResponseText}` };
+            }
         } else {
-            cloudBrowserPreview.style.display = 'none';
+             showToast("AI returned a non-JSON response.", 'info');
+             parsedResponse = { displayText: fullResponseText };
+        }
+    }
+    
+    aiResponse = {
+        displayText: parsedResponse.displayText || (useSearch ? fullResponseText : '[Empty Response]'),
+        actions: parsedResponse.actions
+    };
+    
+    await animateAiResponse(aiMessageElement, aiResponse.displayText);
+    
+    if (useSearch) {
+        const groundingMetadata = response?.candidates?.[0]?.groundingMetadata;
+        if (groundingMetadata?.groundingChunks?.length) {
+            renderCloudBrowserPreview('results', groundingMetadata.groundingChunks);
         }
     } else if (useCodingSandbox) {
-        try {
-            aiResponse = JSON.parse(fullResponseText);
-        } catch (e) {
-            console.warn("Direct JSON.parse failed. Trying to extract from markdown.", fullResponseText);
-            const jsonMatch = fullResponseText.match(/```json\s*([\s\S]*?)\s*```/);
-            if (jsonMatch && jsonMatch[1]) {
-                try {
-                    aiResponse = JSON.parse(jsonMatch[1]);
-                } catch (e2) {
-                    console.error("Failed to parse extracted AI JSON response:", e2, "\nExtracted text:", jsonMatch[1]);
-                    showToast("AI returned malformed JSON.", 'error');
-                    aiResponse = { displayText: `I encountered an error formatting my response. Here's the raw text:\n\n${fullResponseText}` };
-                }
-            } else {
-                 console.error("Failed to parse AI JSON response and no markdown block found:", e, "\nResponse text:", fullResponseText);
-                 showToast("AI did not respond with a valid action.", 'info');
-                 aiResponse = { displayText: `I couldn't generate code actions for your request. Here's my thinking:\n\n${fullResponseText}` };
-            }
-        }
-    } else { // Regular Chat
-        aiResponse = { displayText: fullResponseText };
-        cloudBrowserPreview.style.display = 'none';
-        if (codingToggle.checked) {
-            sandboxContainer.style.display = 'flex';
+        if (aiResponse.actions && aiResponse.actions.length > 0) {
+            showAiActionConfirmation(aiResponse.actions);
         } else {
-            sandboxContainer.style.display = 'none';
+            sandboxContainer.style.display = 'flex';
+        }
+    } else { // Regular Chat with potential sandbox suggestion
+        if (parsedResponse.request_enable_sandbox) {
+            showSandboxRequestModal(messageText);
         }
     }
     
-    await animateAiResponse(aiMessageElement, aiResponse.displayText || '[Empty Response]');
-    
-    if (aiResponse.actions && aiResponse.actions.length > 0) {
-        showAiActionConfirmation(aiResponse.actions);
-    } else {
-         if (useCodingSandbox) sandboxContainer.style.display = 'flex';
-    }
-    
-    const aiMessageContent: Content = { role: 'model', parts: [{ text: JSON.stringify(aiResponse) }]};
+    const aiMessageToSave = useSearch ? { displayText: fullResponseText } : parsedResponse;
+    const aiMessageContent: Content = { role: 'model', parts: [{ text: JSON.stringify(aiMessageToSave) }]};
     allChats[currentChatId].history.push(aiMessageContent);
     saveChatsToStorage();
 
@@ -666,9 +718,9 @@ async function handleSendMessage(event: Event | string) {
         if (errorMessage.includes('429') || errorMessage.includes('RESOURCE_EXHAUSTED')) {
             userFriendlyMessage = "Rate limit reached. You've sent requests too quickly. Please wait a moment before trying again.";
         } else {
-            userFriendlyMessage = "An unexpected error occurred. Please check the console for details.";
+            userFriendlyMessage = `An unexpected error occurred: ${errorMessage}`;
         }
-        contentDiv.innerHTML = `<p>${userFriendlyMessage}</p>`;
+        contentDiv.innerHTML = `<p class="error-text">${userFriendlyMessage}</p>`;
         aiMessageElement.classList.add('error-message');
     }
 
@@ -687,7 +739,7 @@ async function animateTyping(element: HTMLTextAreaElement, code: string) {
     const charsPerSecond = (appSettings.typingWPM * 5) / 60;
     const delay = 1000 / charsPerSecond;
 
-    if (delay < 5) { // Render instantly for very high speed
+    if (delay < 4 || appSettings.typingWPM > 3000) { // Render instantly for very high speed
         element.value = code;
         element.dispatchEvent(new Event('input', { bubbles: true }));
         return;
@@ -698,12 +750,12 @@ async function animateTyping(element: HTMLTextAreaElement, code: string) {
         function type() {
             if (i < code.length) {
                 element.value = code.substring(0, i + 1);
-                element.dispatchEvent(new Event('input', { bubbles: true }));
+                element.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
                 i++;
                 setTimeout(type, delay);
             } else {
                 element.value = code; // Ensure final value is correct
-                element.dispatchEvent(new Event('input', { bubbles: true }));
+                element.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
                 resolve();
             }
         }
@@ -760,7 +812,7 @@ async function createSandboxFile(fileName: string, content: string, fromAI = fal
         sandboxCodeEditor.value = content;
         sandboxCodeEditor.dispatchEvent(new Event('input', { bubbles: true }));
     }
-    saveSandboxState();
+    persistSandboxStateToCurrentChat();
     return id;
 }
 
@@ -777,8 +829,10 @@ async function updateSandboxFile(fileName: string, content: string) {
 function initializeCodingSandbox() {
     renderSandboxTabs();
     if (Object.keys(codingSandboxState.files).length > 0) {
-        const firstFileId = codingSandboxState.activeFileId || Object.keys(codingSandboxState.files)[0];
-        switchActiveSandboxFile(firstFileId);
+        const fileToLoad = codingSandboxState.activeFileId && codingSandboxState.files[codingSandboxState.activeFileId]
+            ? codingSandboxState.activeFileId
+            : Object.keys(codingSandboxState.files)[0];
+        switchActiveSandboxFile(fileToLoad);
     } else {
         switchActiveSandboxFile(null);
     }
@@ -840,7 +894,7 @@ function switchActiveSandboxFile(fileId: string | null) {
         sandboxCodeHighlight.textContent = file.content;
         Prism.highlightElement(sandboxCodeHighlight);
     }
-    saveSandboxState();
+    persistSandboxStateToCurrentChat();
     document.querySelectorAll('.sandbox-tab').forEach(tab => {
         tab.classList.toggle('active', tab.getAttribute('data-file-id') === fileId);
     });
@@ -895,7 +949,7 @@ function deleteSandboxFile(fileId: string, skipConfirm = false) {
             const nextFileId = Object.keys(codingSandboxState.files)[0] || null;
             switchActiveSandboxFile(nextFileId);
         }
-        saveSandboxState();
+        persistSandboxStateToCurrentChat();
         updateSandboxPreview();
     };
 
@@ -934,7 +988,7 @@ function renameSandboxFile(fileId: string, oldName: string) {
             return;
         }
         codingSandboxState.files[fileId].name = newName;
-        saveSandboxState();
+        persistSandboxStateToCurrentChat();
         renderSandboxTabs();
         updateSandboxPreview();
     };
@@ -1024,6 +1078,17 @@ function hideAiActionConfirmation() {
     aiActionModal.style.display = 'none';
     pendingAIActions = null;
 }
+
+function showSandboxRequestModal(originalUserMessage: string) {
+    originalUserMessageForSandboxRequest = originalUserMessage;
+    requestSandboxModal.style.display = 'flex';
+}
+
+function hideSandboxRequestModal() {
+    requestSandboxModal.style.display = 'none';
+    originalUserMessageForSandboxRequest = null;
+}
+
 
 function showConfirmationModal(title: string, text: string, onConfirm: () => void) {
     confirmModalTitle.textContent = title;
@@ -1130,7 +1195,7 @@ function setupSandboxListeners() {
         if (!codingSandboxState.activeFileId) return;
         const content = sandboxCodeEditor.value;
         codingSandboxState.files[codingSandboxState.activeFileId].content = content;
-        saveSandboxState();
+        persistSandboxStateToCurrentChat();
         sandboxCodeHighlight.textContent = content;
         Prism.highlightElement(sandboxCodeHighlight);
     });
@@ -1149,6 +1214,8 @@ function setupSandboxListeners() {
         const target = e.target as HTMLElement;
         const button = target.closest<HTMLButtonElement>('.fix-error-button');
         if (button && button.dataset.errorMessage) {
+            codingToggle.checked = true;
+            codingToggle.dispatchEvent(new Event('change'));
             const prompt = `The code produced this error: "${button.dataset.errorMessage}". Please analyze the files and provide actions to fix it.`;
             handleSendMessage(prompt);
         }
@@ -1241,7 +1308,9 @@ function setupEventListeners() {
         if (target.closest('.history-title-input')) {
             return; // Don't load chat if clicking the input field
         }
-        loadChat(chatId);
+        if (chatId !== currentChatId) {
+            loadChat(chatId);
+        }
     });
     
     historyList.addEventListener('dblclick', (e) => {
@@ -1312,11 +1381,11 @@ function setupEventListeners() {
     typingSpeedSlider.addEventListener('change', saveSettings);
 
     clearSandboxButton.addEventListener('click', () => {
-        showConfirmationModal("Clear Sandbox?", "Are you sure you want to delete all files in the sandbox? This cannot be undone.", () => {
+        showConfirmationModal("Clear Sandbox for this Chat?", "Are you sure you want to delete all files in the sandbox for the current chat? This cannot be undone.", () => {
             codingSandboxState = { activeFileId: null, files: {}, previewFile: 'index.html' };
-            saveSandboxState();
+            persistSandboxStateToCurrentChat();
             initializeCodingSandbox();
-            showToast("Sandbox cleared!", 'success');
+            showToast("Sandbox for this chat has been cleared!", 'success');
         });
         hideSettingsModal();
     });
@@ -1341,6 +1410,19 @@ function setupEventListeners() {
     });
     denyAiActionButton.addEventListener('click', hideAiActionConfirmation);
     aiActionModal.addEventListener('click', e => { if (e.target === aiActionModal) hideAiActionConfirmation() });
+    
+    // Sandbox Request Modal Listeners
+    cancelSandboxRequestButton.addEventListener('click', hideSandboxRequestModal);
+    requestSandboxModal.addEventListener('click', e => { if (e.target === requestSandboxModal) hideSandboxRequestModal() });
+    confirmSandboxRequestButton.addEventListener('click', () => {
+        codingToggle.checked = true;
+        codingToggle.dispatchEvent(new Event('change', { bubbles: true }));
+        hideSandboxRequestModal();
+        if (originalUserMessageForSandboxRequest) {
+            handleSendMessage(originalUserMessageForSandboxRequest);
+        }
+        originalUserMessageForSandboxRequest = null;
+    });
 }
 
 // Initialize the application
