@@ -13,6 +13,9 @@ import saveAs from 'file-saver';
 declare const Prism: any;
 // Make Babel available in the global scope
 declare const Babel: any;
+// Make Prettier available in the global scope
+declare const prettier: any;
+declare const prettierPlugins: any;
 
 
 const API_KEY = process.env.API_KEY;
@@ -72,6 +75,20 @@ const fullscreenButton = document.getElementById('fullscreen-button') as HTMLBut
 const sandboxContextMenu = document.getElementById('sandbox-context-menu') as HTMLElement;
 const contextRename = document.getElementById('context-rename') as HTMLLIElement;
 const contextDelete = document.getElementById('context-delete') as HTMLLIElement;
+const saveCodeButton = document.getElementById('save-code-button') as HTMLButtonElement;
+const historyCodeButton = document.getElementById('history-code-button') as HTMLButtonElement;
+const formatCodeButton = document.getElementById('format-code-button') as HTMLButtonElement;
+const downloadCodeButton = document.getElementById('download-code-button') as HTMLButtonElement;
+
+// File History Modal
+const fileHistoryModal = document.getElementById('file-history-modal') as HTMLElement;
+const fileHistoryTitle = document.getElementById('file-history-title') as HTMLElement;
+const historyVersionList = document.getElementById('history-version-list') as HTMLUListElement;
+const historyCodePre = document.getElementById('history-code-pre') as HTMLElement;
+const historyCodeHighlight = document.getElementById('history-code-highlight') as HTMLElement;
+const closeHistoryButton = document.getElementById('close-history-button') as HTMLButtonElement;
+const restoreHistoryButton = document.getElementById('restore-history-button') as HTMLButtonElement;
+
 
 // Message Context Menu
 const messageContextMenu = document.getElementById('message-context-menu') as HTMLElement;
@@ -111,10 +128,15 @@ type AppSettings = {
     typingWPM: number;
     isSandboxOpen: boolean;
 };
+type FileHistoryEntry = {
+    timestamp: number;
+    content: string;
+};
 type SandboxFile = {
     id: string;
     name: string;
     content: string;
+    history: FileHistoryEntry[];
 };
 type SandboxState = {
     activeFileId: string | null;
@@ -133,9 +155,17 @@ type AIFileAction = {
     file_name: string;
     content?: string;
 };
+type AIWidget = {
+    name: string;
+    html: string;
+    css: string;
+    javascript: string;
+    height?: number;
+};
 type AIResponse = {
     displayText: string;
     actions?: AIFileAction[];
+    widget?: AIWidget;
 };
 
 let allChats: Record<string, ChatSession> = {};
@@ -146,6 +176,7 @@ let pendingAIActions: AIFileAction[] | null = null;
 let contextMenuFileId: string | null = null;
 let contextMenuMessageElement: HTMLElement | null = null;
 let originalUserMessageForSandboxRequest: string | null = null;
+let activeHistoryModal: { fileId: string; selectedTimestamp: number | null } | null = null;
 
 
 let codingSandboxState: SandboxState = {
@@ -194,12 +225,40 @@ const regularChatResponseSchema = {
     properties: {
         displayText: {
             type: Type.STRING,
-            description: "Your text response to the user, formatted in markdown."
+            description: "Your text response to the user, formatted in markdown. This should explain the widget if one is provided."
         },
         request_enable_sandbox: {
             type: Type.BOOLEAN,
             nullable: true,
-            description: "Set to true if you believe the user's request is best handled in the interactive coding sandbox. Otherwise, omit or set to false."
+            description: "Set to true if you believe the user's request is best handled in the interactive coding sandbox. Omit if providing a widget."
+        },
+        widget: {
+            type: Type.OBJECT,
+            nullable: true,
+            description: "An optional self-contained, interactive widget to display directly in the chat.",
+            properties: {
+                name: {
+                    type: Type.STRING,
+                    description: "A short, descriptive name for the widget (e.g., 'Calculator', 'Color Picker')."
+                },
+                html: {
+                    type: Type.STRING,
+                    description: "The HTML content for the widget's body."
+                },
+                css: {
+                    type: Type.STRING,
+                    description: "The CSS styles for the widget. Should be self-contained."
+                },
+                javascript: {
+                    type: Type.STRING,
+                    description: "The JavaScript code for the widget's functionality. Must be self-contained and should not access parent window."
+                },
+                height: {
+                    type: Type.NUMBER,
+                    description: "The suggested height of the widget container in pixels. Defaults to 300.",
+                    nullable: true,
+                }
+            }
         }
     }
 };
@@ -307,6 +366,13 @@ function loadChat(id: string) {
   if (!chat.sandboxState) {
       chat.sandboxState = { activeFileId: null, files: {}, previewFile: 'index.html' };
   }
+  // Backward compatibility for file history
+  Object.values(chat.sandboxState.files).forEach(file => {
+      if (!Array.isArray(file.history)) {
+          file.history = file.content ? [{ timestamp: Date.now(), content: file.content }] : [];
+      }
+  });
+
   // Use a deep copy to prevent mutation issues
   codingSandboxState = JSON.parse(JSON.stringify(chat.sandboxState));
   renderSandboxTabs();
@@ -453,8 +519,10 @@ function appendMessage(sender: 'user' | 'ai', content: AIResponse, animate: bool
   `;
   
   const contentDiv = messageElement.querySelector('.message-content') as HTMLElement;
-
-  if (animate) {
+  
+  if (sender === 'ai' && content.widget) {
+    renderWidgetInMessage(contentDiv, content.widget, content.displayText);
+  } else if (animate) {
       animateAiResponse(messageElement, content.displayText || '');
   } else {
       const textHtml = marked.parse(content.displayText || '') as string;
@@ -530,6 +598,74 @@ function showToast(message: string, type: 'success' | 'error' | 'info' = 'info')
 
 
 // --- Main Chat Logic ---
+function renderWidgetInMessage(container: HTMLElement, widget: AIWidget, displayText: string) {
+    // Clear any previous content (like thinking indicator)
+    container.innerHTML = marked.parse(displayText || 'Here is the widget you requested:') as string;
+    Prism.highlightAllUnder(container);
+
+    const widgetWrapper = document.createElement('div');
+    widgetWrapper.className = 'widget-wrapper';
+
+    const widgetHeader = document.createElement('div');
+    widgetHeader.className = 'widget-header';
+    widgetHeader.innerHTML = `<i class="fa-solid fa-puzzle-piece"></i><span>${widget.name || 'Interactive Widget'}</span>`;
+
+    const iframe = document.createElement('iframe');
+    iframe.className = 'widget-iframe';
+    iframe.sandbox.add('allow-scripts', 'allow-modals');
+    iframe.title = widget.name || 'Interactive Widget';
+    const widgetHeight = widget.height && widget.height > 50 ? widget.height : 300;
+    iframe.style.height = `${widgetHeight}px`;
+
+    const iframeBg = appSettings.theme === 'light' ? '#ffffff' : '#1e1e1e';
+    const iframeFg = appSettings.theme === 'light' ? '#202124' : '#e8eaed';
+
+    const srcDoc = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                :root {
+                    --text-color: ${iframeFg};
+                    --bg-color: ${iframeBg};
+                }
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
+                    margin: 0;
+                    padding: 10px;
+                    background-color: var(--bg-color);
+                    color: var(--text-color);
+                    box-sizing: border-box;
+                }
+                ${widget.css || ''}
+            </style>
+        </head>
+        <body>
+            ${widget.html || ''}
+            <script>
+                (function() {
+                    try {
+                        ${widget.javascript || ''}
+                    } catch(e) {
+                        console.error('Widget Error:', e);
+                        const errorDiv = document.createElement('div');
+                        errorDiv.style.color = 'red';
+                        errorDiv.style.fontFamily = 'monospace';
+                        errorDiv.textContent = 'Error: ' + e.message;
+                        document.body.prepend(errorDiv);
+                    }
+                })();
+            <\/script>
+        </body>
+        </html>
+    `;
+    iframe.srcdoc = srcDoc;
+    
+    widgetWrapper.appendChild(widgetHeader);
+    widgetWrapper.appendChild(iframe);
+
+    container.appendChild(widgetWrapper);
+}
 
 async function animateAiResponse(messageElement: HTMLElement, markdownText: string) {
     const contentDiv = messageElement.querySelector('.message-content') as HTMLElement;
@@ -642,13 +778,22 @@ async function handleSendMessage(event: Event | string) {
             .map(f => `// file: ${f.name}\n${f.content}`)
             .join('\n\n---\n\n');
         
-        const systemInstruction = `You are an expert AI assistant integrated into a coding sandbox. You can handle any programming language or file type. Analyze file names (e.g., .py, .js, .html, .css) and their content to understand the project's context and respond appropriately. Your task is to help the user with their request by generating a sequence of file operations. Analyze the user's request and the provided file content. Be concise. Only modify what is necessary.
-        
-Important: The sandbox preview environment is client-side only (HTML, CSS, JavaScript). Server-side languages like PHP or Python will not execute in the preview, so do not suggest server-side solutions unless specifically asked about backend code.
-        
-Your response MUST be a single JSON object that strictly follows the provided schema. The \`displayText\` property should be a helpful explanation of the changes. Do NOT include any markdown code blocks in the \`displayText\` property. All code must be delivered via file \`actions\`.
+        const systemInstruction = `You are a world-class AI software engineer integrated into a professional coding environment that mirrors VS Code. You have the capability to execute and debug any programming language (client-side or server-side, e.g., Python, PHP, Node.js, TSX) in a secure, containerized backend.
 
-CURRENT FILES IN SANDBOX:
+**Your Task:**
+1.  **Analyze the user's request** in the context of the complete project files provided.
+2.  **Formulate a plan:** Think step-by-step how to fulfill the request. This might involve creating new files, updating existing ones, or deleting obsolete ones.
+3.  **Generate a response:** Your response MUST be a single JSON object that strictly adheres to the provided schema.
+    *   **\`displayText\`:** Provide a concise, helpful explanation of the changes you are about to make. Explain your reasoning. If you are fixing a bug, describe the root cause.
+    *   **\`actions\`:** Create a list of file operations. Be precise. Only modify what is necessary. For updates, provide the FULL, complete content of the file.
+
+**Crucial Instructions:**
+*   You are NOT a simple text generator. You are a code generator and manipulator.
+*   NEVER include markdown code blocks (e.g., \`\`\`js ... \`\`\`) in the \`displayText\` property. ALL code must be delivered through the \`actions\` property.
+*   Analyze file extensions (.py, .php, .tsx) to understand the project's nature and apply the correct logic.
+*   When the user asks to "run" or "debug" the code, explain what you did (e.g., "I executed the Python script," "I compiled and ran the React app") and what the result was (output, errors, etc.). The user's preview pane is only for web-based projects; your execution environment is universal.
+
+**CURRENT FILES IN SANDBOX:**
 ${filesContext || "(No files in sandbox yet)"}`;
         
         request = {
@@ -662,7 +807,13 @@ ${filesContext || "(No files in sandbox yet)"}`;
             }
         };
     } else { // Regular Chat
-        const systemInstruction = `You are an advanced AI agent, Gemini. Your goal is to provide helpful and well-formatted text answers using markdown. If the user asks for a coding task (e.g., writing, modifying, or explaining code), you can suggest enabling the interactive coding sandbox by setting 'request_enable_sandbox' to true in your JSON response.`;
+        const systemInstruction = `You are an advanced AI agent, Gemini. Your goal is to be as helpful as possible.
+You have three main modes of response:
+1.  **Standard Text:** Provide well-formatted text answers using markdown for general questions.
+2.  **Interactive Widget:** For requests that would benefit from a small, interactive UI (like a calculator, color picker, simple game, or data visualizer), you can create a self-contained widget. To do this, populate the 'widget' property in your JSON response with the widget's name, HTML, CSS, and JavaScript. The code must be entirely self-contained. Always provide an explanation of the widget in the 'displayText' property.
+3.  **Coding Sandbox:** For complex coding tasks (e.g., multi-file projects, debugging existing code, building a full webpage), suggest enabling the interactive coding sandbox by setting 'request_enable_sandbox' to true.
+
+Your response must always be a single JSON object that strictly follows the provided schema. Do not use a widget and request the sandbox at the same time.`;
         request = {
             model: 'gemini-2.5-flash',
             contents: [...allChats[currentChatId].history],
@@ -704,10 +855,18 @@ ${filesContext || "(No files in sandbox yet)"}`;
     
     aiResponse = {
         displayText: parsedResponse.displayText || (useSearch ? fullResponseText : '[Empty Response]'),
-        actions: parsedResponse.actions
+        actions: parsedResponse.actions,
+        widget: parsedResponse.widget
     };
+
+    const contentDiv = aiMessageElement.querySelector('.message-content') as HTMLElement;
     
-    await animateAiResponse(aiMessageElement, aiResponse.displayText);
+    if (aiResponse.widget) {
+        renderWidgetInMessage(contentDiv, aiResponse.widget, aiResponse.displayText);
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+    } else {
+        await animateAiResponse(aiMessageElement, aiResponse.displayText);
+    }
     
     if (useSearch) {
         const groundingMetadata = response?.candidates?.[0]?.groundingMetadata;
@@ -832,7 +991,7 @@ async function executeAiActions() {
 
 async function createSandboxFile(fileName: string, content: string, fromAI = false): Promise<string> {
     const id = `file_${Date.now()}_${Math.random()}`;
-    codingSandboxState.files[id] = { id, name: fileName, content: '' }; // Add empty first
+    codingSandboxState.files[id] = { id, name: fileName, content: '', history: [] }; // Add empty first
     renderSandboxTabs();
     switchActiveSandboxFile(id);
     if (fromAI) {
@@ -841,6 +1000,8 @@ async function createSandboxFile(fileName: string, content: string, fromAI = fal
         sandboxCodeEditor.value = content;
         sandboxCodeEditor.dispatchEvent(new Event('input', { bubbles: true }));
     }
+    // Create initial history snapshot
+    saveFileSnapshot(id);
     persistSandboxStateToCurrentChat();
     return id;
 }
@@ -1208,7 +1369,15 @@ function setupSandboxListeners() {
         // Trigger change event to centralize logic (hide panel, save setting)
         codingToggle.dispatchEvent(new Event('change'));
     });
-    runCodeButton.addEventListener('click', () => updateSandboxPreview());
+    runCodeButton.addEventListener('click', () => {
+        // Now, this is primarily a shortcut for asking the AI to run the code.
+        const activeFile = codingSandboxState.activeFileId ? codingSandboxState.files[codingSandboxState.activeFileId] : null;
+        const prompt = activeFile
+            ? `Run the file "${activeFile.name}". If it's part of a larger project (like a web app), run the whole project with "${activeFile.name}" as the context.`
+            : "Run the current project in the sandbox.";
+        handleSendMessage(prompt);
+    });
+    
     addFileButton.addEventListener('click', addSandboxFile);
     fullscreenButton.addEventListener('click', () => {
         sandboxPreviewPanel.classList.toggle('fullscreen');
@@ -1254,7 +1423,7 @@ function setupSandboxListeners() {
         if (!codingSandboxState.activeFileId) return;
         const content = sandboxCodeEditor.value;
         codingSandboxState.files[codingSandboxState.activeFileId].content = content;
-        persistSandboxStateToCurrentChat();
+        // Don't persist on every keystroke, let save button or file switch do it
         sandboxCodeHighlight.textContent = content;
         Prism.highlightElement(sandboxCodeHighlight);
     });
@@ -1275,10 +1444,31 @@ function setupSandboxListeners() {
         if (button && button.dataset.errorMessage) {
             codingToggle.checked = true;
             codingToggle.dispatchEvent(new Event('change'));
-            const prompt = `The code in the sandbox produced this error: "${button.dataset.errorMessage}". You are an expert software engineer. Your task is to analyze all the files in the current sandbox context, identify the root cause of the error, and provide a fix. Explain the problem clearly in the displayText before providing the file actions. Remember, the preview environment is client-side only (HTML, CSS, JavaScript); server-side code like PHP will not execute.`;
+            const prompt = `The code in the sandbox produced this error: "${button.dataset.errorMessage}". You are an expert software engineer. Your task is to analyze all the files in the current sandbox context (which can include any language like HTML, CSS, JS, PHP, Python), identify the root cause of the error, and provide a fix. Explain the problem clearly in the displayText before providing the file actions.`;
             handleSendMessage(prompt);
         }
     });
+
+    // Sandbox Actions
+    saveCodeButton.addEventListener('click', () => {
+        if (codingSandboxState.activeFileId) {
+            saveFileSnapshot(codingSandboxState.activeFileId);
+        } else {
+            showToast("No active file to save.", "info");
+        }
+    });
+
+    historyCodeButton.addEventListener('click', () => {
+        if (codingSandboxState.activeFileId) {
+            showFileHistoryModal(codingSandboxState.activeFileId);
+        } else {
+            showToast("No active file to view history for.", "info");
+        }
+    });
+    
+    formatCodeButton.addEventListener('click', formatActiveFile);
+    downloadCodeButton.addEventListener('click', downloadProject);
+
 
     let isResizing = false;
     sandboxResizer.addEventListener('mousedown', () => {
@@ -1510,17 +1700,8 @@ function setupEventListeners() {
         hideSettingsModal();
     });
 
-    exportZipButton.addEventListener('click', async () => {
-        if (Object.keys(codingSandboxState.files).length === 0) {
-            showToast("Sandbox is empty. Nothing to export.", 'info');
-            return;
-        }
-        const zip = new JSZip();
-        Object.values(codingSandboxState.files).forEach(file => {
-            zip.file(file.name, file.content);
-        });
-        const blob = await zip.generateAsync({ type: "blob" });
-        saveAs(blob, "gemini-sandbox-project.zip");
+    exportZipButton.addEventListener('click', () => {
+        downloadProject();
         hideSettingsModal();
     });
 
@@ -1543,7 +1724,182 @@ function setupEventListeners() {
         }
         originalUserMessageForSandboxRequest = null;
     });
+
+    // File History Modal Listeners
+    closeHistoryButton.addEventListener('click', hideFileHistoryModal);
+    fileHistoryModal.addEventListener('click', e => { if(e.target === fileHistoryModal) hideFileHistoryModal(); });
+    restoreHistoryButton.addEventListener('click', restoreFileFromHistory);
+
 }
+
+// --- Sandbox Tools ---
+function saveFileSnapshot(fileId: string) {
+    const file = codingSandboxState.files[fileId];
+    if (!file) return;
+
+    const currentContent = file.content;
+    const lastVersion = file.history[file.history.length - 1];
+
+    if (!lastVersion || lastVersion.content !== currentContent) {
+        file.history.push({
+            timestamp: Date.now(),
+            content: currentContent,
+        });
+        persistSandboxStateToCurrentChat();
+        showToast(`Saved version for ${file.name}`, "success");
+    } else {
+        showToast("No changes to save.", "info");
+    }
+}
+
+function showFileHistoryModal(fileId: string) {
+    const file = codingSandboxState.files[fileId];
+    if (!file || file.history.length === 0) {
+        showToast("No history found for this file.", "info");
+        return;
+    }
+
+    activeHistoryModal = { fileId, selectedTimestamp: null };
+    fileHistoryTitle.textContent = `History for: ${file.name}`;
+    historyVersionList.innerHTML = '';
+
+    // Sort descending
+    const sortedHistory = [...file.history].reverse();
+
+    sortedHistory.forEach((version, index) => {
+        const li = document.createElement('li');
+        li.className = 'history-version-item';
+        li.dataset.timestamp = String(version.timestamp);
+        li.textContent = new Date(version.timestamp).toLocaleString();
+        if (index === 0) {
+            li.textContent += ' (Latest)';
+        }
+        li.addEventListener('click', () => selectHistoryVersion(version));
+        historyVersionList.appendChild(li);
+    });
+
+    // Select the first (latest) version by default
+    selectHistoryVersion(sortedHistory[0]);
+    fileHistoryModal.style.display = 'flex';
+}
+
+function selectHistoryVersion(version: FileHistoryEntry) {
+    if (!activeHistoryModal) return;
+    
+    activeHistoryModal.selectedTimestamp = version.timestamp;
+
+    document.querySelectorAll('.history-version-item').forEach(item => {
+        item.classList.toggle('active', item.getAttribute('data-timestamp') === String(version.timestamp));
+    });
+    
+    const file = codingSandboxState.files[activeHistoryModal.fileId];
+    const language = getLanguageFromFilename(file.name);
+    historyCodeHighlight.className = `language-${language}`;
+    historyCodeHighlight.textContent = version.content;
+    Prism.highlightElement(historyCodeHighlight);
+
+    restoreHistoryButton.disabled = false;
+}
+
+function hideFileHistoryModal() {
+    fileHistoryModal.style.display = 'none';
+    activeHistoryModal = null;
+}
+
+function restoreFileFromHistory() {
+    if (!activeHistoryModal || !activeHistoryModal.selectedTimestamp) return;
+
+    const { fileId, selectedTimestamp } = activeHistoryModal;
+    const file = codingSandboxState.files[fileId];
+    const versionToRestore = file.history.find(h => h.timestamp === selectedTimestamp);
+
+    if (file && versionToRestore) {
+        file.content = versionToRestore.content;
+        
+        // If restoring to the active file, update the editor
+        if (fileId === codingSandboxState.activeFileId) {
+            sandboxCodeEditor.value = file.content;
+            sandboxCodeEditor.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+
+        saveFileSnapshot(fileId); // Save the restored version as a new "latest"
+        persistSandboxStateToCurrentChat();
+        showToast(`Restored ${file.name} to selected version.`, 'success');
+    }
+    hideFileHistoryModal();
+}
+
+async function downloadProject() {
+    if (Object.keys(codingSandboxState.files).length === 0) {
+        showToast("Sandbox is empty. Nothing to download.", 'info');
+        return;
+    }
+    const zip = new JSZip();
+    Object.values(codingSandboxState.files).forEach(file => {
+        zip.file(file.name, file.content);
+    });
+    const blob = await zip.generateAsync({ type: "blob" });
+    saveAs(blob, "gemini-sandbox-project.zip");
+    showToast("Project download started!", "success");
+}
+
+function formatActiveFile() {
+    if (!codingSandboxState.activeFileId) {
+        showToast("No active file to format.", "info");
+        return;
+    }
+    if (typeof prettier === 'undefined' || typeof prettierPlugins === 'undefined') {
+        showToast("Formatting library is not available.", "error");
+        return;
+    }
+
+    const file = codingSandboxState.files[codingSandboxState.activeFileId];
+    const lang = getLanguageFromFilename(file.name);
+    
+    let parser: string;
+    let plugins: any[];
+    
+    switch(lang) {
+        case 'javascript':
+        case 'jsx':
+        case 'typescript':
+        case 'tsx':
+            parser = 'babel-ts';
+            plugins = [prettierPlugins.babel];
+            break;
+        case 'css':
+            parser = 'css';
+            plugins = [prettierPlugins.postcss];
+            break;
+        case 'markup':
+        case 'html':
+            parser = 'html';
+            plugins = [prettierPlugins.html];
+            break;
+        default:
+            showToast(`Formatting not supported for ${lang} files.`, "info");
+            return;
+    }
+
+    try {
+        const formattedCode = prettier.format(file.content, {
+            parser: parser,
+            plugins: plugins,
+            tabWidth: 4,
+            semi: true,
+        });
+
+        sandboxCodeEditor.value = formattedCode;
+        // Trigger input event to update state and highlighting
+        sandboxCodeEditor.dispatchEvent(new Event('input', { bubbles: true }));
+        saveFileSnapshot(file.id);
+        showToast(`${file.name} formatted successfully.`, "success");
+    } catch (e: any) {
+        console.error("Prettier formatting error:", e);
+        showToast(`Could not format code: ${e.message}`, "error");
+    }
+}
+
 
 // Initialize the application
 initializeApp();
