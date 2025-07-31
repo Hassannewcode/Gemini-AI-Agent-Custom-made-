@@ -11,6 +11,9 @@ import saveAs from 'file-saver';
 
 // Make Prism available in the global scope for TypeScript
 declare const Prism: any;
+// Make Babel available in the global scope
+declare const Babel: any;
+
 
 const API_KEY = process.env.API_KEY;
 
@@ -100,6 +103,7 @@ type AppSettings = {
     theme: 'dark' | 'light';
     temperature: number;
     typingWPM: number;
+    isSandboxOpen: boolean;
 };
 type SandboxFile = {
     id: string;
@@ -130,7 +134,7 @@ type AIResponse = {
 
 let allChats: Record<string, ChatSession> = {};
 let currentChatId: string | null = null;
-let appSettings: AppSettings = { theme: 'dark', temperature: 0.5, typingWPM: 155 };
+let appSettings: AppSettings = { theme: 'dark', temperature: 0.5, typingWPM: 155, isSandboxOpen: false };
 const CONFIRMATION_PHRASE = "Clear all of my chat history";
 let pendingAIActions: AIFileAction[] | null = null;
 let contextMenuFileId: string | null = null;
@@ -243,20 +247,26 @@ function initializeApp() {
   loadChatsFromStorage();
   applyTheme();
   renderChatHistory();
+
+  // Set toggle state from settings before loading chat.
+  codingToggle.checked = appSettings.isSandboxOpen;
+  
   const latestChatId = Object.keys(allChats).sort((a, b) => allChats[b].createdAt - allChats[a].createdAt)[0];
   if (latestChatId) {
     loadChat(latestChatId);
   } else {
     startNewChat();
   }
+  
   setupEventListeners();
   setupSandboxListeners();
   
-  // Initial UI state based on toggle
+  // Now, based on the checked state, initialize the UI.
   if (codingToggle.checked) {
-    sandboxContainer.style.display = 'flex';
+      // This will show the container and render the files.
+      initializeCodingSandbox();
   } else {
-    sandboxContainer.style.display = 'none';
+      sandboxContainer.style.display = 'none';
   }
 }
 
@@ -306,8 +316,12 @@ function loadChat(id: string) {
   cloudBrowserPreview.style.display = 'none';
   
   // Reset toggles to a neutral state, will be updated by history or user
-  codingToggle.checked = false;
-  sandboxContainer.style.display = 'none';
+  // The global app setting for sandbox visibility will be handled by initializeApp
+  if (!appSettings.isSandboxOpen) {
+      codingToggle.checked = false;
+  }
+  searchToggle.checked = false;
+
 
   if (chat.history.length === 0) {
     appendMessage('ai', { displayText: 'Hello! I\'m Gemini. How can I assist you today?'});
@@ -997,13 +1011,13 @@ function renameSandboxFile(fileId: string, oldName: string) {
     input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') (ev.target as HTMLInputElement).blur(); });
 }
 
-function updateSandboxPreview(targetFile: string = 'index.html') {
+async function updateSandboxPreview(targetFile: string = 'index.html') {
     sandboxConsoleOutput.innerHTML = '';
     codingSandboxState.previewFile = findFileByName(targetFile) ? targetFile : 'index.html';
     
     let html = `<div style="font-family: sans-serif; text-align: center; padding: 2rem;"><h2>404: Not Found</h2><p>Could not find <strong>${codingSandboxState.previewFile}</strong> in the sandbox.</p></div>`;
     let css = '';
-    let js = '';
+    let scriptContent = '';
     
     const files = Object.values(codingSandboxState.files);
     const htmlFile = files.find(f => f.name === codingSandboxState.previewFile);
@@ -1016,9 +1030,31 @@ function updateSandboxPreview(targetFile: string = 'index.html') {
     }
 
     files.forEach(f => {
-        if (f.name.endsWith('.css')) css += f.content;
-        if (f.name.endsWith('.js')) js += f.content;
+        if (f.name.endsWith('.css')) {
+            css += `/*==> ${f.name} <==*/\n${f.content}\n\n`;
+        } else if (/\.(js|jsx|ts|tsx)$/.test(f.name)) {
+            // Wrap in IIFE to prevent scope collision
+            scriptContent += `\n// File: ${f.name}\n;\n(function(){\n${f.content}\n})();\n`;
+        }
     });
+
+    let transpiledJs = '';
+    if (scriptContent && typeof Babel !== 'undefined') {
+        try {
+            const output = Babel.transform(scriptContent, {
+                presets: ['react', 'typescript'],
+                filename: 'sandbox.tsx' // A dummy filename to hint Babel about JSX/TSX
+            }).code;
+            transpiledJs = output || '';
+        } catch (e: any) {
+            logToSandboxConsole('error', `Babel Transpilation Error: ${e.message}`);
+            return; // Don't proceed if transpilation fails
+        }
+    } else if (scriptContent) {
+        logToSandboxConsole('error', 'Babel is not loaded. Cannot transpile advanced scripts.');
+        transpiledJs = scriptContent; // Attempt to run as-is
+    }
+
 
     const injectedScripts = `
         const iframeConsole={log:(...a)=>window.parent.postMessage({type:"console",level:"log",message:a.map(b=>JSON.stringify(b,null,2)).join(" ")},"*"),error:(...a)=>window.parent.postMessage({type:"console",level:"error",message:a.map(b=>b?b.stack||JSON.stringify(b,null,2):'undefined').join(" ")},"*"),warn:(...a)=>window.parent.postMessage({type:"console",level:"warn",message:a.map(b=>JSON.stringify(b,null,2)).join(" ")},"*")};
@@ -1035,7 +1071,7 @@ function updateSandboxPreview(targetFile: string = 'index.html') {
                 }
             }
         });
-        try{${js}}catch(e){iframeConsole.error(e)}
+        try{${transpiledJs}}catch(e){iframeConsole.error(e)}
     `;
 
     const srcDoc = `<!DOCTYPE html><html><head><style>${css}</style></head><body>${html}<script>${injectedScripts}<\/script></body></html>`;
@@ -1149,7 +1185,8 @@ function applyTheme() {
 function setupSandboxListeners() {
     closeSandboxButton.addEventListener('click', () => {
         codingToggle.checked = false;
-        sandboxContainer.style.display = 'none'
+        // Trigger change event to centralize logic (hide panel, save setting)
+        codingToggle.dispatchEvent(new Event('change'));
     });
     runCodeButton.addEventListener('click', () => updateSandboxPreview());
     addFileButton.addEventListener('click', addSandboxFile);
@@ -1286,7 +1323,11 @@ function setupEventListeners() {
     });
 
     searchToggle.addEventListener('change', () => { if (searchToggle.checked) codingToggle.checked = false; });
+    
     codingToggle.addEventListener('change', () => {
+        appSettings.isSandboxOpen = codingToggle.checked;
+        saveSettings();
+
         if (codingToggle.checked) {
             searchToggle.checked = false;
             initializeCodingSandbox();
