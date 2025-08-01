@@ -170,7 +170,7 @@ type AIResponse = {
 
 let allChats: Record<string, ChatSession> = {};
 let currentChatId: string | null = null;
-let appSettings: AppSettings = { theme: 'dark', temperature: 0.5, typingWPM: 155, isSandboxOpen: false };
+let appSettings: AppSettings = { theme: 'dark', temperature: 0.5, typingWPM: 800, isSandboxOpen: false };
 const CONFIRMATION_PHRASE = "Clear all of my chat history";
 let pendingAIActions: AIFileAction[] | null = null;
 let contextMenuFileId: string | null = null;
@@ -187,6 +187,7 @@ let codingSandboxState: SandboxState = {
 
 const sandboxActionSchema = {
     type: Type.OBJECT,
+    required: ['displayText'],
     properties: {
         displayText: {
             type: Type.STRING,
@@ -194,7 +195,6 @@ const sandboxActionSchema = {
         },
         actions: {
             type: Type.ARRAY,
-            nullable: true,
             description: "An optional list of file operations for the coding sandbox.",
             items: {
                 type: Type.OBJECT,
@@ -211,7 +211,6 @@ const sandboxActionSchema = {
                     },
                     content: {
                         type: Type.STRING,
-                        nullable: true,
                         description: "The full code content of the file. Required for 'create_file' and 'update_file'."
                     }
                 }
@@ -222,6 +221,7 @@ const sandboxActionSchema = {
 
 const regularChatResponseSchema = {
     type: Type.OBJECT,
+    required: ['displayText'],
     properties: {
         displayText: {
             type: Type.STRING,
@@ -229,12 +229,10 @@ const regularChatResponseSchema = {
         },
         request_enable_sandbox: {
             type: Type.BOOLEAN,
-            nullable: true,
             description: "Set to true if you believe the user's request is best handled in the interactive coding sandbox. Omit if providing a widget."
         },
         widget: {
             type: Type.OBJECT,
-            nullable: true,
             description: "An optional self-contained, interactive widget to display directly in the chat.",
             properties: {
                 name: {
@@ -256,7 +254,6 @@ const regularChatResponseSchema = {
                 height: {
                     type: Type.NUMBER,
                     description: "The suggested height of the widget container in pixels. Defaults to 300.",
-                    nullable: true,
                 }
             }
         }
@@ -510,7 +507,7 @@ function appendMessage(sender: 'user' | 'ai', content: AIResponse, animate: bool
   messageElement.className = `message ${sender}-message`;
   const avatarSrc = sender === 'user'
     ? 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxyZWN0IHdpZHRoPSIxOCIgaGVpZ2h0PSIxOCIgeD0iMyIgeT0iMyIgcng9IjEwMCIvPjxwYXRoIGQ9Ik0xOCAxN2ExMi44IDEyLjggMCAwIDAtMTIgMCIvPjwvc3ZnPg=='
-    : 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNDgiIGhlaWdodD0iNDgiIHZpZXdCb3g9IjAgMCA0OCA0OCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTI0IDRDMTIuOTU0MyA0IDQgMTIuOTU0MyA0IDI0QzQgMzUuMDQ1NyAxMi45NTQzIDQ0IDI0IDQ0QzM1LjA0NTcgNDQgNDQgMzUuMDQ1NyA0NCAyNEM0NCAxMi45NTQzIDM1LjA0NTcgNCAyNCA0WiIgZmlsbD0iIzhBQjRGOCIvPgo8cGF0aCBmaWxsLXJ1bGU9ImV2ZW5vZGQiIGNsaXAtcnVsZT0iZXZlbm9kZCIgZD0iTTI0LjAwMDEgMTJDMjguMjgxOCAxMiAzMi4xMzg0IDEzLjc5MjQgMzQuODE2OCAxNi41ODE2QzMzLjU2MTMgMTguNzA5IDMyLjM5MjYgMjAuOTEwMyAzMS4zMTA2IDIzLjE4NTNDMzAuOTgzOSAyMy45MDA5IDMxLjA1NDYgMjQuNzMzMSAzMS41MjIyIDI1LjM5OThDMzIuOTU4NyAyNy4yNDcxIDM0LjkwODQgMjkuMjE1MiAzNy4zNzMyIDMxLjI5MzNDMzUuNzk3OSAzMy4zMjU5IDMzLjcyNTkgMzQuOTA1NiAzMS4yODQxIDM1LjgwMUMyOS4wNzE1IDM2LjYxMTYgMjYuNjU3NSAzNi41MjYyIDI0LjU3MTQgMzUuNTY4M0MyMC42NzEgMzMuODAxNiAxNy44MDg1IDMwLjE0MTMgMTcuMzg4MiAyNS44MzQ0QzE2Ljk2NzggMjEuNTI3NSAxOS4wNjg5IDE3LjQzMzMgMjIuODQyNyAxNS4zNTI0QzI0Ljg5MTYgMTQuMjg4MiAyNy4yNDU4IDE0LjE2MjMgMjkuNDE4NCAxNC45NDU4QzI4LjUzNjEgMTQuMTI4NyAyNy42NzQ5IDEzLjM4NTcgMjYuODM0NyAxMi43MTY4QzI1Ljk2ODYgMTIuMjQ3MSAyNC45OTk2IDEyIDI0LjAwMDEgMTJaIiBmaWxsPSJ3aGl0ZSIvPgo8cGF0aCBmaWxsLXJ1bGU9ImV2ZW5vZGQiIGNsaXAtcnVsZT0iZXZlbm9kZCIgZD0iTTE2LjU4MTYgMzQuODE2OEMxOC43MDkgMzMuNTYxMyAyMC45MTAzIDMyLjM5MjYgMjMuMTg1MyAzMS4zMTA2QzIzLjkwMDkgMzAuOTgzOSAyNC43MzMxIDMxLjA1NDYgMjUuMzk5OCAzMS41MjIyQzI3LjI0NzEgMzIuOTU4NyAyOS4yMTUyIDM0LjkwODQgMzEuMjkzMyAzNy4zNzMyQzMzLjMyNTkgMzUuNzk3OSAzNC45MDU2IDMzLjcyNTkgMzUuODAxIDMxLjI4NDFDMzYuNjExNiAyOS4wNzE1IDM2LjUyNjIgMjYuNjU3NSAzNS41NjgzIDI0LjU3MTRDMzMuODAxNiAyMC42NzEgMzAuMTQxMyAxNy44MDg1IDI1LjgzNDQgMTcuMzg4MkMyMS41Mjc1IDE2Ljk2NzggMTcuNDMzMyAxOS4wNjg5IDE1LjM1MjQgMjIuODQyN0MxNC4yODgyIDI0Ljg5MTYgMTQuMTYyMyAyNy4yNDU4IDE0Ljk0NTggMjkuNDE4NEMxNC4xMjg3IDI4LjUzNjEgMTMuMzg1NyAyNy42NzQ5IDEyLjcxNjggMjYuODM0N0MxMi4yNDcxIDI1Ljk2ODYgMTIgMjQuOTk5NiAxMiAyNC4wMDAxQzEyIDI4LjI4MTggMTMuNzkyNCAzMi4xMzg0IDE2LjU4MTYgMzQuODE2OFoiIGZpbGw9IndoaXRlIi8+Cjwvc3ZnPgo=';
+    : 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNDgiIGhlaWdodD0iNDgiIHZpZXdCb3g9IjAgMCA0OCA0OCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTI0IDRDMTIuOTU0MyA0IDQgMTIuOTU0MyA0IDI0QzQgMzUuMDQ1NyAxMi45NTQzIDQ0IDI0IDQ0QzM1LjA0NTcgNDQgNDQgMzUuMDQ1NyA0NCAyNEM0NCAxMi45NTQzIDM1LjA0NTcgNCAyNCA0WiIgZmlsbD0iIzhBQjRGOCIvPgo8cGF0aCBmaWxsLXJ1bGU9ImV2ZW5vZGQiIGNsaXAtcnVsZT0iZXZlbm9kZCIgZD0iTTI0LjAwMDEgMTJDMjguMjgxOCAxMiAzMi4xMzg0IDEzLjc5MjQgMzQuODE2OCAxNi41ODE2QzMzLjU2MTMgMTguNzA5IDMyLjM5MjYgMjAuOTEwMyAzMS4zMTA2IDIzLjE4NTNDMzAuOTgzOSAyMy45MDA5IDMxLjA1NDYgMjQuNzMzMSAzMS41MjIyIDI1LjM5OThDMzIuOTU4NyAyNy4yNDcxIDM0LjkwODQgMjkuMjE1MiAzNy4zNzMyIDMxLjI5MzNDMzUuNzk3OSAzMy4zMjU5IDMzLjcyNTkgMzQuOTA1NiAzMS4yODQxIDM1LjgwMUMyOS4wNzE1IDM2LjYxMTYgMjYuNjU3NSAzNi41MjYyIDI0LjU3MTQgMzUuNTY4M0MyMC42NzEgMzMuODAxNiAxNy44MDg1IDMwLjE0MTMgMTcuMzg4MiAyNS44MzQ0QzE2Ljk2NzggMjEuNTI3NSAxOS4wNjg5IDE3LjQzMzMgMjIuODQyNyAxNS4zNTI0QzI0Ljg5MTYgMTQuMjg4MiAyNy4yNDU4IDE0LjE2MjMgMjkuNDE4NCAxNC55NDU4QzI4LjUzNjEgMTQuMTI4NyAyNy42NzQ5IDEzLjM4NTcgMjYuODM0NyAxMi43MTY4QzI1Ljk2ODYgMTIuMjQ3MSAyNC45OTk2IDEyIDI0LjAwMDEgMTJaIiBmaWxsPSJ3aGl0ZSIvPgo8cGF0aCBmaWxsLXJ1bGU9ImV2ZW5vZGQiIGNsaXAtcnVsZT0iZXZlbm9kZCIgZD0iTTE2LjU4MTYgMzQuODE2OEMxOC43MDkgMzMuNTYxMyAyMC45MTAzIDMyLjM5MjYgMjMuMTg1MyAzMS4zMTA2QzIzLjkwMDkgMzAuOTgzOSAyNC43MzMxIDMxLjA1NDYgMjUuMzk5OCAzMS41MjIyQzI3LjI0NzEgMzIuOTU4NyAyOS4yMTUyIDM0LjkwODQgMzEuMjkzMyAzNy4zNzMyQzMzLjMyNTkgMzUuNzk3OSAzNC45MDU2IDMzLjcyNTkgMzUuODAxIDMxLjI4NDFDMzYuNjExNiAyOS4wNzE1IDM2LjUyNjIgMjYuNjU3NSAzNS41NjgzIDI0LjU3MTRDMzMuODAxNiAyMC42NzEgMzAuMTQxMyAxNy44MDg1IDI1LjgzNDQgMTcuMzg4MkMyMS41Mjc1IDE2Ljk2NzggMTcuNDMzMyAxOS4wNjg5IDE1LjM1MjQgMjIuODQyN0MxNC4yODgyIDI0Ljg5MTYgMTQuMTYyMyAyNy4yNDU4IDE0Ljk0NTggMjkuNDE4NEMxNC4xMjg3IDI4LjUzNjEgMTMuMzg1NyAyNy42NzQ5IDEyLjcxNjggMjYuODM0N0MxMi4yNDcxIDI1Ljk2ODYgMTIgMjQuOTk5NiAxMiAyNC4wMDAxQzEyIDI4LjI4MTggMTMuNzkyNCAzMi4xMzg0IDE2LjU4MTYgMzQuODE2OFoiIGZpbGw9IndoaXRlIi8+Cjwvc3ZnPgo=';
   
   messageElement.innerHTML = `
       <img src="${avatarSrc}" alt="${sender} Avatar" class="avatar">
